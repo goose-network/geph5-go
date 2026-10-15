@@ -7,6 +7,7 @@ This is **not** a reimplementation of the broker or exit side — it speaks the 
 - **Module:** `github.com/geph-official/geph5-go`
 - **Go version:** 1.27
 - **Scope:** the client engine (`binaries/geph5-client` in the Rust workspace). ~14k LOC across 29 packages.
+- **Also:** a provider plugin for the [goose](https://github.com/goose-network/goose) proxy-pool engine (`plugins/geph`) that embeds this client, proven against a real Rust exit with real traffic.
 - **Status:** `go build ./...`, `go vet ./...`, and `go test ./...` all pass clean.
 
 ## What is ported
@@ -35,6 +36,31 @@ go vet ./...
 go test ./...
 ```
 
+### Real-network tests
+
+Two end-to-end tests dial a **real Rust `geph5-exit`** and push real HTTP
+through the full tunnel — the geph plugin here, and the goose engine that
+loads it. They need the exit binary (built in the geph5 Rust workspace) and
+are gated behind the `geph_real` build tag / `GEPH_EXIT_BIN` env var:
+
+```bash
+# plugin level (this repo): full handshake + HTTP through the tunnel
+GEPH_EXIT_BIN=../geph5/bin-out/geph5-exit \
+GEPH_TEST_TARGET=223.5.5.5:80 \
+go test -tags geph_real -v ./plugins/geph/
+
+# engine level (goose): provider provisioned via goose's REST API,
+# pool fill, HTTP through inbound -> pool -> geph tunnel, metric recorded
+cd ../goose
+GEPH_EXIT_BIN=../geph5/bin-out/geph5-exit \
+GEPH_TEST_TARGET=223.5.5.5:80 \
+GOTOOLCHAIN=go1.26.8 go test -run TestE2E_Geph -v ./test/e2e/
+```
+
+`GEPH_TEST_TARGET` (optional) additionally pushes one request to a real
+internet host through the tunnel; it must be an IP-literal `host:port` the
+exit can reach.
+
 > **gVisor version pin.** The VPN stack uses [`gvisor.dev/gvisor`](https://gvisor.dev) pinned to **`v0.0.0-20260218152508-eed1cebf761e`**. Later snapshots (e.g. `v0.0.0-20260924013400-27d5517ed85b`) carry a packaging defect where `bridge_test.go` declares `package bridge_test` inside the `stack` directory, which breaks `go build`. Do not upgrade gVisor without verifying the build.
 
 ## Running
@@ -50,6 +76,37 @@ Flags:
 | `--config <path>` | Path to a YAML config file (**required**). |
 | `--stdio_vpn` | Use stdin/stdout as a VPN interface (16-bit big-endian length-prefixed raw IP packets). |
 | `--vpn_fd <int>` | Wire an already-open platform-VPN file descriptor into the daemon (`-1` = none). Uses the same 16-bit BE framing. |
+
+## Goose provider plugin
+
+`plugins/geph` packages the client core as a **provider plugin** for the
+[goose](https://github.com/goose-network/goose) proxy-pool engine: it embeds
+the full client — auth loop, session manager with its 6 concurrent tunnels,
+SOCKS5 listener — and once the first tunnel to a geph5 exit is live, advertises
+one `socks5` outbound that goose merges into a managed pool. Any goose inbound
+routed through that pool then forwards traffic through real geph5 tunnels. The
+plugin imports only `goose-plugin-api` on the goose side (never goose itself),
+preserving goose's plugin import boundary; it lives inside this module because
+it embeds our `internal/` packages.
+
+`internal/clientlib` is the embeddable bundle behind it and is usable directly,
+with no goose involved:
+
+```go
+client, err := clientlib.Start(ctx, clientlib.Options{
+    Socks5Listen: "127.0.0.1:0", // ephemeral loopback; the default
+    Config:       cfg,           // must carry exit_constraint
+})
+addr := client.SocksAddr()       // bound address — valid from Start on
+// client.SessionCount() > 0     // readiness: CONNECTs succeed from here on
+```
+
+The listener binds synchronously (bind errors fail `Start`); session
+establishment proceeds in the background, so connections arriving before the
+first session simply fail.
+
+See [plugins/geph/README.md](plugins/geph/README.md) for the plugin's config
+keys, bootstrap lifecycle, goose wiring, and the real-network test commands.
 
 ## Configuration
 
@@ -142,6 +199,10 @@ internal/
   stdcode                bincode-compatible varint serialization
   blake3                 BLAKE3 hashing
   chacha20poly1305       ChaCha8-Poly1305 AEAD
+  clientlib              embeddable client bundle (auth + sessions + SOCKS5)
+  tools                  layer-isolated wire repro harnesses (pprobemux, psessmgr)
+plugins/
+  geph                   goose provider plugin embedding the client core
 ```
 
 ### Data path (how a SOCKS5 connection becomes a tunneled stream)

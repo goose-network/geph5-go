@@ -51,7 +51,7 @@ type Client struct {
 	cancel  context.CancelFunc
 	stopped chan struct{} // closed when all goroutines have exited
 
-	sessMgr  *session.Manager
+	sessMgr   *session.Manager
 	socksAddr string // the address the SOCKS5 listener actually bound
 }
 

@@ -12,6 +12,11 @@
 // control RPC server (tcp/unix/pipe). In dry_run mode only the control RPC
 // server runs.
 //
+// The client core is also embeddable directly (internal/clientlib) and as a
+// provider plugin for the goose proxy-pool engine (plugins/geph), which
+// advertises the client's loopback SOCKS5 listener as a goose outbound once a
+// tunnel to an exit is live.
+//
 // See the package README for the full architecture, configuration reference,
 // and wire-compatibility notes. Key packages:
 //
@@ -21,6 +26,8 @@
 //   - internal/session   — session manager tying routes, dialers, and handshakes
 //   - internal/vpn       — gVisor userspace TCP/IP stack + stdio/fd VPN framing
 //   - internal/control   — control RPC service (13 snake_case methods)
+//   - internal/clientlib — embeddable client bundle (auth + sessions + SOCKS5)
+//   - plugins/geph       — goose provider plugin embedding the client core
 //
 // gVisor is pinned to v0.0.0-20260218152508-eed1cebf761e; do not upgrade
 // without verifying the build (later snapshots carry a packaging defect that
