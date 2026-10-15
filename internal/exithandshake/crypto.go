@@ -10,7 +10,7 @@
 //
 //  2. Exit replies ExitHello (stdcode): { inner: ExitHelloInner, signature: ed25519 sig [64 bytes] }
 //     - signature is over stdcode(&(client_hello, exit_hello.inner)) — the
-//       concatenation of the ClientHello encoding and the ExitHelloInner encoding.
+//     concatenation of the ClientHello encoding and the ExitHelloInner encoding.
 //     - ExitHelloInner::X25519(their_epk [32]) | SharedSecretResponse(mac [32]) | Reject(String)
 //
 //  3. For X25519: shared = DH(my_esk, their_epk); read_key = blake3::derive_key("e2c", shared);
@@ -68,6 +68,34 @@ func (c *ClientCryptHello) MarshalStdcode() ([]byte, error) {
 	return e.Bytes(), nil
 }
 
+// UnmarshalStdcode decodes ClientCryptHello (externally-tagged enum). It is
+// the server-side counterpart of MarshalStdcode: the exit parses the client's
+// hello to dispatch on the crypt variant.
+func (c *ClientCryptHello) UnmarshalStdcode(b []byte) error {
+	d := stdcode.NewDecoder(b)
+	idx, err := d.DecodeEnum()
+	if err != nil {
+		return err
+	}
+	switch idx {
+	case 0:
+		c.Kind = KindSharedSecret
+		if err := d.NeedExact(32); err != nil {
+			return err
+		}
+		copy(c.Challenge[:], d.RemainingBytes()[:32])
+	case 1:
+		c.Kind = KindX25519
+		if err := d.NeedExact(32); err != nil {
+			return err
+		}
+		copy(c.X25519Pub[:], d.RemainingBytes()[:32])
+	default:
+		return fmt.Errorf("exithandshake: unknown ClientCryptHello variant %d", idx)
+	}
+	return nil
+}
+
 // ClientHello is the top-level client hello: { credentials: Vec<u8>, crypt_hello: ClientCryptHello }.
 type ClientHello struct {
 	Credentials []byte // stdcode-encoded credentials, or empty
@@ -86,12 +114,24 @@ func (h *ClientHello) MarshalStdcode() ([]byte, error) {
 	return e.Bytes(), nil
 }
 
+// UnmarshalStdcode decodes ClientHello. It is the server-side counterpart of
+// MarshalStdcode: the exit parses the length-prepended hello blob.
+func (h *ClientHello) UnmarshalStdcode(b []byte) error {
+	d := stdcode.NewDecoder(b)
+	credentials, err := d.DecodeBytes()
+	if err != nil {
+		return fmt.Errorf("exithandshake: decode credentials: %w", err)
+	}
+	h.Credentials = credentials
+	return h.CryptHello.UnmarshalStdcode(d.RemainingBytes())
+}
+
 // ExitHelloInner is the exit's response payload.
 type ExitHelloInner struct {
-	Kind       ExitHelloInnerKind
-	X25519Pub  [32]byte // Kind == InnerX25519
-	MAC        [32]byte // Kind == InnerSharedSecretResponse
-	RejectReason string // Kind == InnerReject
+	Kind         ExitHelloInnerKind
+	X25519Pub    [32]byte // Kind == InnerX25519
+	MAC          [32]byte // Kind == InnerSharedSecretResponse
+	RejectReason string   // Kind == InnerReject
 }
 
 type ExitHelloInnerKind uint8
@@ -99,9 +139,9 @@ type ExitHelloInnerKind uint8
 // Discriminants match the Rust declaration order in
 // geph5_misc_rpc::exit::ExitHelloInner (Reject, SharedSecretResponse, X25519).
 const (
-	InnerReject                 ExitHelloInnerKind = 0
-	InnerSharedSecretResponse   ExitHelloInnerKind = 1
-	InnerX25519                 ExitHelloInnerKind = 2
+	InnerReject               ExitHelloInnerKind = 0
+	InnerSharedSecretResponse ExitHelloInnerKind = 1
+	InnerX25519               ExitHelloInnerKind = 2
 )
 
 // MarshalStdcode encodes ExitHelloInner as the externally-tagged enum
@@ -163,6 +203,16 @@ func (i *ExitHelloInner) UnmarshalStdcode(b []byte) error {
 type ExitHello struct {
 	Inner     ExitHelloInner
 	Signature [64]byte
+}
+
+// MarshalStdcode encodes ExitHello. It is the server-side counterpart of
+// UnmarshalStdcode: the exit builds its signed response with it.
+func (h *ExitHello) MarshalStdcode() ([]byte, error) {
+	innerBytes, err := h.Inner.MarshalStdcode()
+	if err != nil {
+		return nil, err
+	}
+	return append(innerBytes, h.Signature[:]...), nil
 }
 
 // UnmarshalStdcode decodes ExitHello.

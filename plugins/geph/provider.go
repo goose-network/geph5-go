@@ -40,6 +40,7 @@
 //	                                             // (config.LoadYAML format)
 //	  "socks_listen": "127.0.0.1:0",             // client listener (default
 //	                                             // ephemeral loopback)
+//	  "embedded_exit": true,                     // run the exit in-process
 //	  "outbound_id":  "geph",                    // goose outbound id
 //	  "exit_constraint": {"direct": "host:port/<exit-pubkey-hex>"},
 //	  "credentials":  "test_dummy",              // credential (see
@@ -56,10 +57,29 @@
 // "config_path" loads the full client YAML; the inline keys (when present)
 // are applied on top, so a static YAML can be reused while the plugin
 // overrides the listener and exit constraint.
+//
+// # Standalone mode (embedded exit)
+//
+// Setting "embedded_exit" boots a geph5 exit server (internal/exitlib, a Go
+// port of the Rust geph5-exit serving path) inside the provider's own
+// process and pins the client at it with an auto-generated direct
+// constraint, overriding any configured exit_constraint. The whole chain —
+// goose engine, geph client, geph exit — then runs in ONE process with no
+// Rust binary, no broker, and no second process. This is the deployment
+// shape for self-contained single-box setups (and the plugin's standalone
+// test). "embedded_exit" accepts true or an object:
+//
+//	{ "listen": "127.0.0.1:0", "allow_loopback": true, "seed_hex": "<64 hex>" }
+//
+// "allow_loopback" relaxes the exit's global-routability rules so it will
+// proxy to loopback targets in the same process — normally the exit refuses
+// them exactly like the Rust one; "seed_hex" pins the exit's ed25519
+// signing seed (otherwise a fresh key is generated per boot).
 package geph
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -68,8 +88,10 @@ import (
 
 	pub "github.com/goose-network/goose-plugin-api"
 
+	"github.com/geph-official/geph5-go/internal/brokerproto"
 	"github.com/geph-official/geph5-go/internal/clientlib"
 	"github.com/geph-official/geph5-go/internal/config"
+	"github.com/geph-official/geph5-go/internal/exitlib"
 )
 
 func init() {
@@ -87,6 +109,7 @@ type Provider struct {
 	socksAddr string // the embedded client's SOCKS5 listener address
 	startErr  error  // terminal startup error, surfaced via Outbounds
 	client    *clientlib.Client
+	exit      *exitlib.Exit // non-nil in standalone (embedded_exit) mode
 
 	// watch signals the engine that the outbound set changed (ready flip).
 	watchCh chan struct{}
@@ -109,6 +132,54 @@ type providerConfig struct {
 	Cache          string          `json:"cache"`
 	Broker         json.RawMessage `json:"broker"`
 	BrokerKeys     json.RawMessage `json:"broker_keys"`
+
+	// EmbeddedExit enables standalone mode. json.RawMessage so the value can
+	// be true or an options object; parsed by embeddedExitOptions.
+	EmbeddedExit json.RawMessage `json:"embedded_exit"`
+}
+
+// embeddedExitOptions is the parsed "embedded_exit" object form.
+type embeddedExitOptions struct {
+	Listen        string `json:"listen"`
+	AllowLoopback bool   `json:"allow_loopback"`
+	SeedHex       string `json:"seed_hex"`
+}
+
+// parseEmbeddedExit parses the "embedded_exit" config value: absent/false
+// means disabled, true means defaults, and an object carries the knobs.
+func parseEmbeddedExit(raw json.RawMessage) (embeddedExitOptions, bool, error) {
+	if len(raw) == 0 {
+		return embeddedExitOptions{}, false, nil
+	}
+	var enabled bool
+	if err := json.Unmarshal(raw, &enabled); err == nil {
+		return embeddedExitOptions{}, enabled, nil
+	}
+	var opts embeddedExitOptions
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		return embeddedExitOptions{}, false, fmt.Errorf("geph provider: embedded_exit must be true or an object: %w", err)
+	}
+	return opts, true, nil
+}
+
+// exitlibOptions converts the plugin knob into exitlib.Options, consuming
+// SeedHex when given.
+func (o embeddedExitOptions) exitlibOptions() (exitlib.Options, error) {
+	opts := exitlib.Options{
+		C2EListen:     o.Listen,
+		AllowLoopback: o.AllowLoopback,
+	}
+	if o.SeedHex != "" {
+		seed, err := hex.DecodeString(o.SeedHex)
+		if err != nil {
+			return exitlib.Options{}, fmt.Errorf("geph provider: embedded_exit seed_hex: %w", err)
+		}
+		if len(seed) != 32 {
+			return exitlib.Options{}, fmt.Errorf("geph provider: embedded_exit seed_hex must be 64 hex chars (32 bytes), got %d bytes", len(seed))
+		}
+		copy(opts.Seed[:], seed)
+	}
+	return opts, nil
 }
 
 // New is the ProviderFactory registered as "geph". It parses the config and
@@ -291,6 +362,37 @@ func (p *Provider) run(ctx context.Context) {
 		return
 	}
 
+	// Standalone mode: boot the exit server in-process and pin the client at
+	// it, overriding whatever exit constraint the config carried (a log note,
+	// not an error — the point of embedded_exit is to not need one).
+	if raw := p.cfg.EmbeddedExit; len(raw) > 0 {
+		opts, enabled, err := parseEmbeddedExit(raw)
+		if err != nil {
+			p.setTerminal(err)
+			return
+		}
+		if enabled {
+			exitOpts, err := opts.exitlibOptions()
+			if err != nil {
+				p.setTerminal(err)
+				return
+			}
+			exit, err := exitlib.Start(ctx, exitOpts)
+			if err != nil {
+				p.setTerminal(fmt.Errorf("geph provider: start embedded exit: %w", err))
+				return
+			}
+			p.mu.Lock()
+			p.exit = exit
+			p.mu.Unlock()
+			clientCfg.ExitConstraint = brokerproto.ExitConstraint{
+				Kind:   "direct",
+				Direct: exit.C2EAddr() + "/" + exit.PubkeyHex(),
+			}
+			log.Printf("geph provider: embedded exit serving c2e at %s (pubkey %s); exit constraint overridden", exit.C2EAddr(), exit.PubkeyHex())
+		}
+	}
+
 	client, err := clientlib.Start(ctx, clientlib.Options{
 		Socks5Listen: p.cfg.SocksListen,
 		Config:       clientCfg,
@@ -395,9 +497,10 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	}, nil
 }
 
-// Close stops the embedded geph5 client and waits for the run goroutine to
-// exit. The engine's provider manager does not call Close on providers; this
-// exists for embedders and tests that manage the provider lifecycle themselves.
+// Close stops the embedded exit (standalone mode), the embedded geph5
+// client, and the run goroutine. The engine's provider manager does not call
+// Close on providers; this exists for embedders and tests that manage the
+// provider lifecycle themselves.
 func (p *Provider) Close() error {
 	if p.stop != nil {
 		p.stop()
@@ -405,6 +508,10 @@ func (p *Provider) Close() error {
 	<-p.stopped
 	p.mu.Lock()
 	p.ready = false
+	if p.exit != nil {
+		p.exit.Close()
+		p.exit = nil
+	}
 	if p.client != nil {
 		p.client.Close()
 	}

@@ -2,12 +2,12 @@
 
 A Go port of the [geph5](https://github.com/geph-official/geph5) **client core**, byte-for-byte wire-compatible with the existing Rust broker and exits.
 
-This is **not** a reimplementation of the broker or exit side — it speaks the same JSON-RPC, sosistab3/picomux framing, and ed25519-signed route formats as the Rust `geph5-client`, so a Go client connects to a Rust broker and through Rust exits transparently.
+This is **not** a reimplementation of the broker or exit side — it speaks the same JSON-RPC, sosistab3/picomux framing, and ed25519-signed route formats as the Rust `geph5-client`, so a Go client connects to a Rust broker and through Rust exits transparently. For single-process deployments, [`internal/exitlib`](#standalone-one-process-operation) also implements the **exit server** side in Go, so the client and the exit can run in one process with no Rust binary at all.
 
 - **Module:** `github.com/geph-official/geph5-go`
 - **Go version:** 1.27
 - **Scope:** the client engine (`binaries/geph5-client` in the Rust workspace). ~14k LOC across 29 packages.
-- **Also:** a provider plugin for the [goose](https://github.com/goose-network/goose) proxy-pool engine (`plugins/geph`) that embeds this client, proven against a real Rust exit with real traffic.
+- **Also:** a provider plugin for the [goose](https://github.com/goose-network/goose) proxy-pool engine (`plugins/geph`) that embeds this client, proven against a real Rust exit with real traffic — and, via its `embedded_exit` option, against the Go exit in the same process.
 - **Status:** `go build ./...`, `go vet ./...`, and `go test ./...` all pass clean.
 
 ## What is ported
@@ -61,6 +61,24 @@ GOTOOLCHAIN=go1.26.8 go test -run TestE2E_Geph -v ./test/e2e/
 internet host through the tunnel; it must be an IP-literal `host:port` the
 exit can reach.
 
+### Standalone tests (no Rust binary)
+
+Two further end-to-end tests run the **Go exit** (`internal/exitlib`) in the
+same process as the client — no `geph5-exit` binary, no env vars, no second
+process — and are part of the default `go test ./...`:
+
+- `internal/exitlib` — a bare `clientlib` client tunnels through a Go exit:
+  small + 192 KiB HTTP responses byte-exact, plus allow-rule negative tests
+  (plain loopback refused; allowed with `AllowLoopback`).
+- `plugins/geph` `TestGephProviderStandalone` — the goose provider in
+  `embedded_exit` mode: plugin + client + exit in one process, HTTP and a
+  192 KiB body through the provider's SOCKS5 outbound.
+
+In goose, `test/e2e.TestE2E_GephProviderStandalone` proves the same at
+engine level: admin-API-provisioned provider (embedded exit), pool fill,
+HTTP through inbound → pool → tunnel → embedded exit → loopback target, and
+the recorded metric — the entire chain in the test process.
+
 > **gVisor version pin.** The VPN stack uses [`gvisor.dev/gvisor`](https://gvisor.dev) pinned to **`v0.0.0-20260218152508-eed1cebf761e`**. Later snapshots (e.g. `v0.0.0-20260924013400-27d5517ed85b`) carry a packaging defect where `bridge_test.go` declares `package bridge_test` inside the `stack` directory, which breaks `go build`. Do not upgrade gVisor without verifying the build.
 
 ## Running
@@ -104,6 +122,33 @@ addr := client.SocksAddr()       // bound address — valid from Start on
 The listener binds synchronously (bind errors fail `Start`); session
 establishment proceeds in the background, so connections arriving before the
 first session simply fail.
+
+### Standalone (one-process) operation
+
+`internal/exitlib` is the geph5 **exit server** as an embeddable library —
+the c2e side of the protocol, mirroring the Rust `geph5-exit` serving path
+(conntest echo → X25519+ed25519 handshake → ChaCha20Poly1305 records →
+picomux → tunnel relay with the Rust allow rules). Paired with `clientlib`
+the full client→tunnel→exit chain runs in one process, no Rust binary:
+
+```go
+exit, err := exitlib.Start(ctx, exitlib.Options{
+    // C2EListen: "127.0.0.1:0" (default, ephemeral), Seed: zero = random
+    // ed25519 seed, AllowLoopback: permit loopback targets (self-tests /
+    // single-box deployments; the Rust exit always refuses them).
+})
+client, err := clientlib.Start(ctx, clientlib.Options{
+    Config: &config.Config{ExitConstraint: brokerproto.ExitConstraint{
+        Kind: "direct", Direct: exit.C2EAddr() + "/" + exit.PubkeyHex(),
+    }},
+})
+```
+
+Deviations from the Rust exit (invisible on the wire for the supported
+paths): no b2e/broker listener, no credential verification (same as a
+broker-less Rust exit), no DNS filtering, no IPv6 eyeballing, no UDP
+tunnels; `AllowLoopback` is a Go-only escape hatch. The plugin's
+`embedded_exit` option (see below) wraps exactly this for goose.
 
 See [plugins/geph/README.md](plugins/geph/README.md) for the plugin's config
 keys, bootstrap lifecycle, goose wiring, and the real-network test commands.
@@ -183,6 +228,7 @@ internal/
   session                session manager: combines route + dialer + exit handshake
   dialer                 route -> sillad.Dialer (direct, bound-tcp)
   exithandshake          client/exit X25519 handshake + encrypted pipe
+  exitlib                embeddable geph5 exit server (standalone mode)
   sosistab3              obfuscated transport (cookie, handshake, state, pipe)
   picomux                stream multiplexer over a sillad.Pipe
   meeklike               meek-like datagram obfuscation (virta stream reassembly)

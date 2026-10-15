@@ -18,13 +18,13 @@
 package exithandshake
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
-	"crypto/cipher"
 
 	"golang.org/x/crypto/chacha20poly1305"
 

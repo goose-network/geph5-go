@@ -17,6 +17,12 @@ goose inbound ──▶ pool (managed by provider) ──▶ socks5 ──▶ em
                                                               Rust geph5-exit ──▶ internet
 ```
 
+With the `embedded_exit` option the last hop changes: a **Go** geph5 exit
+(`geph5-go`'s `internal/exitlib`) runs inside the provider's own process, so
+the whole chain — goose engine, geph client, geph exit — is one process with
+no Rust binary, no broker, and no external exit (see
+[Standalone mode](#standalone-mode-embedded-exit)).
+
 The package lives inside the geph5-go module (not a separate repo) because it
 embeds geph5-go's `internal/` packages (`internal/clientlib` → `internal/auth`,
 `internal/session`, …), which Go's internal-package rule confines to this
@@ -48,6 +54,7 @@ config where they make sense as provider knobs:
 {
   "config_path":     "/path/to/geph5.yaml",
   "socks_listen":    "127.0.0.1:0",
+  "embedded_exit":   true,
   "outbound_id":     "geph",
   "exit_constraint": { "direct": "host:port/<exit-pubkey-hex>" },
   "secret":          "...",
@@ -61,6 +68,7 @@ config where they make sense as provider knobs:
 |---|---|---|
 | `config_path` | — | Full client YAML (`config.LoadYAML` format; see the module README) as the base config. |
 | `socks_listen` | `127.0.0.1:0` | Address for the embedded client's SOCKS5 listener; `:0` picks an ephemeral loopback port. |
+| `embedded_exit` | — | Standalone mode: boot the geph5 exit in-process (see below). `true` or `{ "listen", "allow_loopback", "seed_hex" }`. |
 | `outbound_id` | `geph` | The goose outbound id the provider advertises. |
 | `exit_constraint` | — | The client's exit constraint in its native enum shape: `"auto"`, `{"direct": "host:port/pubkeyhex"}`, `{"hostname": "..."}`, etc. |
 | `credentials` | — | Full credential object, when a broker is used (`{"secret": ...}`, `"test_dummy"`, or `{"legacy_username_password": {...}}`). |
@@ -74,7 +82,7 @@ config where they make sense as provider knobs:
 top of it, so a shared YAML can be reused while the plugin overrides the
 listener or exit constraint.
 
-Two shapes cover the common cases:
+Three shapes cover the common cases:
 
 - **Broker mode** — set `broker`, `broker_keys`, credentials, and
   `exit_constraint: "auto"` (or a country/id constraint); the session manager
@@ -82,6 +90,47 @@ Two shapes cover the common cases:
 - **Direct mode** — skip the broker entirely and pin one exit with
   `exit_constraint: {"direct": "host:port/<pubkeyhex>"}` plus `secret`. The
   exit's public key is the ed25519 key derived from its `signing_secret` seed.
+- **Standalone mode (embedded exit)** — set `embedded_exit`; see below.
+
+## Standalone mode (embedded exit)
+
+`"embedded_exit": true` boots a geph5 exit server — `geph5-go`'s
+`internal/exitlib`, a Go port of the Rust `geph5-exit` serving path — inside
+the provider's own process, generates a direct constraint for it, and
+overrides whatever `exit_constraint` the config carried. The full chain (goose
+engine, geph client, geph exit) then runs in **one process** with no Rust
+binary, no broker, and no second process:
+
+```json
+{
+  "providers": [
+    {
+      "id": "geph-prov",
+      "provider": "geph",
+      "pool_id": "geph-pool",
+      "config": {
+        "embedded_exit": { "allow_loopback": true },
+        "secret": "any-value-here"
+      }
+    }
+  ]
+}
+```
+
+The object form carries the knobs:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `listen` | `127.0.0.1:0` | c2e listener address; the default picks an ephemeral loopback port. |
+| `allow_loopback` | `false` | Permit loopback targets. The Rust exit (and the Go port by default) refuse non-globally-routable targets; this escape hatch is for single-box setups where the "internet" the exit reaches is a local server. |
+| `seed_hex` | random per boot | 64 hex chars pinning the exit's ed25519 signing seed, so the exit's pubkey is stable across restarts. |
+
+Credentials are not verified in this mode (the embedded exit has no broker,
+exactly like a broker-less Rust exit), so `secret` can be any string; a fresh
+signing key is generated per boot unless `seed_hex` pins one. The engine-level
+proof is `goose`'s `TestE2E_GephProviderStandalone` and the plugin-level proof
+is `TestGephProviderStandalone` here — both run in the default test suites
+with no external dependencies.
 
 ## Wiring into goose
 
@@ -121,8 +170,13 @@ through the tunnels.
 ## Tests
 
 Unit tests (`go test ./plugins/geph/`) cover config parsing and registration
-with no network. The real-network test needs a **Rust geph5-exit binary** and
-is gated behind the `geph_real` build tag:
+with no network. The standalone test (`TestGephProviderStandalone`, no build
+tag, part of the default suite) boots the provider with `embedded_exit` and
+pushes HTTP — small + 192 KiB multi-frame responses — through the plugin's
+SOCKS5 outbound into the embedded exit, all in one process.
+
+The real-network test needs a **Rust geph5-exit binary** and is gated behind
+the `geph_real` build tag:
 
 ```bash
 GEPH_EXIT_BIN=/path/to/geph5/bin-out/geph5-exit \
@@ -133,10 +187,9 @@ go test -tags geph_real -v ./plugins/geph/
 It boots a real exit, connects the provider through the full handshake, and
 pushes real HTTP through the tunnel (small + 192 KiB multi-frame responses to
 a hermetic loopback target, plus a real-internet request when
-`GEPH_TEST_TARGET` is set). The engine-level counterpart — provider
-provisioned through goose's REST API, pool fill, HTTP through the whole chain,
-metric persistence — lives in
-[`goose/test/e2e/geph_test.go`](../../goose/test/e2e/geph_test.go).
+`GEPH_TEST_TARGET` is set). The engine-level counterparts live in goose's
+`test/e2e`: `geph_test.go` (real Rust exit, gated by `GEPH_EXIT_BIN`) and
+`geph_standalone_test.go` (embedded exit, default suite).
 
 Wire-protocol details (serde variant ordering, the metadata stream, exit
 constraints) are in the module README's
