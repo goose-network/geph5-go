@@ -36,7 +36,21 @@ func Serve(ctx context.Context, listenAddr string, openConn session.OpenConnFunc
 	if err != nil {
 		return fmt.Errorf("socks5: listen %s: %w", listenAddr, err)
 	}
-	log.Printf("socks5: listening on %s", listenAddr)
+	return serveOn(ctx, ln, openConn)
+}
+
+// ServeOn serves a SOCKS5 listener that has already been bound (the listener
+// is owned by the caller's lifetime of ctx: it is closed when ctx is
+// canceled). It is the embedder-friendly variant used by clientlib, which
+// binds up front so it can report the actual bound address of an ephemeral
+// port before Serve runs.
+func ServeOn(ctx context.Context, ln net.Listener, openConn session.OpenConnFunc) error {
+	return serveOn(ctx, ln, openConn)
+}
+
+// serveOn runs the accept loop on a bound listener.
+func serveOn(ctx context.Context, ln net.Listener, openConn session.OpenConnFunc) error {
+	log.Printf("socks5: listening on %s", ln.Addr())
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -105,20 +119,22 @@ func handshake(client net.Conn) (host string, port uint16, err error) {
 		return "", 0, fmt.Errorf("write method: %w", err)
 	}
 	// Request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT
-	if _, err := io.ReadFull(client, buf[:3]); err != nil {
+	var hdr [3]byte
+	if _, err := io.ReadFull(client, hdr[:]); err != nil {
 		return "", 0, fmt.Errorf("read request header: %w", err)
 	}
-	if buf[0] != 0x05 {
+	if hdr[0] != 0x05 {
 		return "", 0, errors.New("socks5: bad request version")
 	}
-	if buf[1] != 0x01 { // only CONNECT
+	if hdr[1] != 0x01 { // only CONNECT
 		return "", 0, errors.New("socks5: only CONNECT supported")
 	}
-	// buf[2] is RSV (reserved, must be 0x00). Read ATYP next.
-	if _, err := io.ReadFull(client, buf[:1]); err != nil {
+	// hdr[2] is RSV (reserved, must be 0x00). Read ATYP next.
+	var atypBuf [1]byte
+	if _, err := io.ReadFull(client, atypBuf[:]); err != nil {
 		return "", 0, fmt.Errorf("read atyp: %w", err)
 	}
-	atyp := buf[0]
+	atyp := atypBuf[0]
 	switch atyp {
 	case 0x01: // IPv4
 		ip := make([]byte, 4)
@@ -127,10 +143,11 @@ func handshake(client net.Conn) (host string, port uint16, err error) {
 		}
 		host = net.IP(ip).String()
 	case 0x03: // domain
-		if _, err := io.ReadFull(client, buf[:1]); err != nil {
+		var lenBuf [1]byte
+		if _, err := io.ReadFull(client, lenBuf[:]); err != nil {
 			return "", 0, fmt.Errorf("read domain len: %w", err)
 		}
-		domain := make([]byte, int(buf[0]))
+		domain := make([]byte, int(lenBuf[0]))
 		if _, err := io.ReadFull(client, domain); err != nil {
 			return "", 0, fmt.Errorf("read domain: %w", err)
 		}

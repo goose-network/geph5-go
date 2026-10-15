@@ -179,6 +179,58 @@ func (b *BrokerSource) UnmarshalYAML(value *yaml.Node) error {
 	return fmt.Errorf("config: unexpected yaml node kind %d for broker source", value.Kind)
 }
 
+// UnmarshalJSON decodes BrokerSource from JSON. The JSON shape mirrors the
+// YAML: a bare string (direct), an object with a single variant key, or an
+// array (race). This matters because config.ParseYAML round-trips YAML
+// through encoding/json, and embedders (e.g. the goose plugin) pass JSON
+// config maps directly.
+func (b *BrokerSource) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		b.Kind = "direct"
+		b.Direct = s
+		return nil
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(data, &arr); err == nil {
+		b.Kind = "race"
+		b.Race = make([]BrokerSource, 0, len(arr))
+		for _, item := range arr {
+			var sub BrokerSource
+			if err := json.Unmarshal(item, &sub); err != nil {
+				return err
+			}
+			b.Race = append(b.Race, sub)
+		}
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	if len(m) != 1 {
+		return fmt.Errorf("config: broker source map must have exactly one key, got %d", len(m))
+	}
+	for k, v := range m {
+		// decodeVariant expects a yaml.Node; round-trip the JSON value through
+		// YAML so the same variant-decoding code serves both decoders.
+		var node yaml.Node
+		var probe any
+		if err := json.Unmarshal(v, &probe); err != nil {
+			return err
+		}
+		rawYAML, err := yaml.Marshal(probe)
+		if err != nil {
+			return err
+		}
+		if err := yaml.Unmarshal(rawYAML, &node); err != nil {
+			return err
+		}
+		return b.decodeVariant(k, &node)
+	}
+	return fmt.Errorf("config: empty broker source")
+}
+
 func (b *BrokerSource) decodeVariant(key string, payload *yaml.Node) error {
 	switch key {
 	case "direct":

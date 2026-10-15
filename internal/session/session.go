@@ -173,7 +173,7 @@ func (m *Manager) sessionWorker(ctx context.Context, id int) {
 			}
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, timeout)
-		err := m.runSessionOnce(dialCtx, id)
+		err := m.runSessionOnce(ctx, dialCtx, id)
 		cancel()
 		if ctx.Err() != nil {
 			return
@@ -204,18 +204,23 @@ func (m *Manager) sessionWorker(ctx context.Context, id int) {
 
 // runSessionOnce establishes one session: get_dialer -> dial -> client_auth ->
 // start_mux -> register -> proxy_loop. Blocks until the session dies.
-func (m *Manager) runSessionOnce(ctx context.Context, id int) error {
-	exitPubkey, exitDesc, dial, err := m.fetchDialer(ctx)
+//
+// dialCtx bounds the establishment phase (get_dialer, dial, client_auth) only;
+// once the session is up, it lives until the mux dies or ctx (the manager's
+// lifetime) is canceled — the dial deadline must not become a session
+// lifetime, or every healthy tunnel would be torn down after 30–60s.
+func (m *Manager) runSessionOnce(ctx, dialCtx context.Context, id int) error {
+	exitPubkey, exitDesc, dial, err := m.fetchDialer(dialCtx)
 	if err != nil {
 		return fmt.Errorf("get_dialer: %w", err)
 	}
-	// Dial with the remaining time on ctx.
-	pipe, err := dial.Dial(ctx)
+	// Dial with the remaining time on dialCtx.
+	pipe, err := dial.Dial(dialCtx)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	// Authenticate.
-	authedPipe, err := m.clientAuth(ctx, pipe, exitPubkey)
+	authedPipe, err := m.clientAuth(dialCtx, pipe, exitPubkey)
 	if err != nil {
 		pipe.Close()
 		return fmt.Errorf("client_auth: %w", err)
@@ -227,6 +232,19 @@ func (m *Manager) runSessionOnce(ctx context.Context, id int) error {
 		Timeout:      livenessTimeout,
 	})
 	mux.SetDebloat(true)
+	// Register the session metadata (Rust: "we first register the session
+	// metadata" — the first JSON-metadata stream on each session). The exit
+	// only accepts tunnel-command streams once this is registered; without it
+	// the first tunnel open would be swallowed as metadata. Default to JSON
+	// null when sess_metadata is unset, matching serde_json::Value::default().
+	if len(m.sessMetadata) == 0 {
+		m.sessMetadata = json.RawMessage("null")
+	}
+	if metaStream, err := mux.Open(m.sessMetadata); err == nil {
+		// The exit reads and discards the metadata stream; close ours so its
+		// handler completes instead of lingering.
+		metaStream.Close()
+	}
 	// Register the session.
 	label := fmt.Sprintf("exit %s (%s)", exitDesc.Country, exitDesc.C2EListen)
 	slot := m.registerSession(mux, label, exitDesc, "")

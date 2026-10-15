@@ -41,11 +41,14 @@ type ClientCryptHello struct {
 	Challenge [32]byte
 }
 
+// Variant discriminants match the Rust declaration order in
+// geph5_misc_rpc::exit::ClientCryptHello (SharedSecretChallenge first, X25519
+// second) — serde's externally-tagged enums number variants by position.
 type ClientCryptHelloKind uint8
 
 const (
-	KindX25519 ClientCryptHelloKind = 0
-	KindSharedSecret ClientCryptHelloKind = 1
+	KindSharedSecret ClientCryptHelloKind = 0
+	KindX25519       ClientCryptHelloKind = 1
 )
 
 // MarshalStdcode encodes ClientCryptHello as the externally-tagged enum
@@ -53,12 +56,12 @@ const (
 func (c *ClientCryptHello) MarshalStdcode() ([]byte, error) {
 	e := stdcode.NewEncoder()
 	switch c.Kind {
-	case KindX25519:
-		e.EncodeU32(0)
-		e.EncodeRaw(c.X25519Pub[:])
 	case KindSharedSecret:
-		e.EncodeU32(1)
+		e.EncodeU32(0)
 		e.EncodeRaw(c.Challenge[:])
+	case KindX25519:
+		e.EncodeU32(1)
+		e.EncodeRaw(c.X25519Pub[:])
 	default:
 		return nil, fmt.Errorf("exithandshake: invalid ClientCryptHello kind %d", c.Kind)
 	}
@@ -93,10 +96,12 @@ type ExitHelloInner struct {
 
 type ExitHelloInnerKind uint8
 
+// Discriminants match the Rust declaration order in
+// geph5_misc_rpc::exit::ExitHelloInner (Reject, SharedSecretResponse, X25519).
 const (
-	InnerX25519 ExitHelloInnerKind = 0
-	InnerSharedSecretResponse ExitHelloInnerKind = 1
-	InnerReject ExitHelloInnerKind = 2
+	InnerReject                 ExitHelloInnerKind = 0
+	InnerSharedSecretResponse   ExitHelloInnerKind = 1
+	InnerX25519                 ExitHelloInnerKind = 2
 )
 
 // MarshalStdcode encodes ExitHelloInner as the externally-tagged enum
@@ -106,15 +111,15 @@ const (
 func (i *ExitHelloInner) MarshalStdcode() ([]byte, error) {
 	e := stdcode.NewEncoder()
 	switch i.Kind {
-	case InnerX25519:
+	case InnerReject:
 		e.EncodeU32(0)
-		e.EncodeRaw(i.X25519Pub[:])
+		e.EncodeString(i.RejectReason)
 	case InnerSharedSecretResponse:
 		e.EncodeU32(1)
 		e.EncodeRaw(i.MAC[:])
-	case InnerReject:
+	case InnerX25519:
 		e.EncodeU32(2)
-		e.EncodeString(i.RejectReason)
+		e.EncodeRaw(i.X25519Pub[:])
 	default:
 		return nil, fmt.Errorf("exithandshake: invalid ExitHelloInner kind %d", i.Kind)
 	}
@@ -130,11 +135,12 @@ func (i *ExitHelloInner) UnmarshalStdcode(b []byte) error {
 	}
 	switch idx {
 	case 0:
-		i.Kind = InnerX25519
-		if err := d.NeedExact(32); err != nil {
+		i.Kind = InnerReject
+		s, err := d.DecodeString()
+		if err != nil {
 			return err
 		}
-		copy(i.X25519Pub[:], d.RemainingBytes()[:32])
+		i.RejectReason = s
 	case 1:
 		i.Kind = InnerSharedSecretResponse
 		if err := d.NeedExact(32); err != nil {
@@ -142,12 +148,11 @@ func (i *ExitHelloInner) UnmarshalStdcode(b []byte) error {
 		}
 		copy(i.MAC[:], d.RemainingBytes()[:32])
 	case 2:
-		i.Kind = InnerReject
-		s, err := d.DecodeString()
-		if err != nil {
+		i.Kind = InnerX25519
+		if err := d.NeedExact(32); err != nil {
 			return err
 		}
-		i.RejectReason = s
+		copy(i.X25519Pub[:], d.RemainingBytes()[:32])
 	default:
 		return fmt.Errorf("exithandshake: unknown ExitHelloInner variant %d", idx)
 	}
@@ -173,15 +178,11 @@ func (h *ExitHello) UnmarshalStdcode(b []byte) error {
 	}
 	switch idx {
 	case 0:
-		if err := d.Skip(32); err != nil {
-			return err
-		}
-	case 1:
-		if err := d.Skip(32); err != nil {
-			return err
-		}
-	case 2:
 		if _, err := d.DecodeString(); err != nil {
+			return err
+		}
+	case 1, 2:
+		if err := d.Skip(32); err != nil {
 			return err
 		}
 	default:

@@ -34,10 +34,14 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// debugFrames enables TX/RX frame logging to stderr when GEPH_PICO_DEBUG is set.
+var debugFrames = os.Getenv("GEPH_PICO_DEBUG") != ""
 
 // Frame commands.
 const (
@@ -130,9 +134,7 @@ type streamState struct {
 	sendWindowCap int
 
 	// outbound write side
-	writeCh chan []byte
 	writeEOF atomic.Bool
-
 	// signals
 	finSent atomic.Bool
 }
@@ -209,12 +211,14 @@ func (pm *PicoMux) die(err error) {
 	if pm.alive.CompareAndSwap(true, false) {
 		pm.deadErr = err
 		close(pm.deadCh)
-		// Close all streams.
+		// Close all streams. recvCh may already be closed by handleFIN, so
+		// synchronize each close on the same recvEOF swap it used.
 		pm.mu.Lock()
 		for _, ss := range pm.streams {
 			ss.closed.Store(true)
-			close(ss.recvCh)
-			close(ss.writeCh)
+			if !ss.recvEOF.Swap(true) {
+				close(ss.recvCh)
+			}
 		}
 		pm.streams = make(map[uint32]*streamState)
 		pm.mu.Unlock()
@@ -270,7 +274,6 @@ func (pm *PicoMux) newStreamState(id uint32, metadata []byte) *streamState {
 		id:            id,
 		metadata:      metadata,
 		recvCh:        make(chan []byte, 256),
-		writeCh:       make(chan []byte, 256),
 		sendWindowCap: initWindow,
 	}
 	// sendWindow semaphore: initWindow permits.
@@ -283,6 +286,9 @@ func (pm *PicoMux) newStreamState(id uint32, metadata []byte) *streamState {
 
 // sendFrame writes a single frame to the connection. Thread-safe.
 func (pm *PicoMux) sendFrame(streamID uint32, command uint8, body []byte) error {
+	if debugFrames {
+		fmt.Fprintf(os.Stderr, "PICO-TX cmd=%d id=%d len=%d body=%q\n", command, streamID, len(body), body)
+	}
 	if len(body) > maxBodyLen {
 		return fmt.Errorf("picomux: body too large (%d)", len(body))
 	}
@@ -332,6 +338,9 @@ func (pm *PicoMux) readLoop() {
 		if err != nil {
 			pm.die(fmt.Errorf("picomux: read: %w", err))
 			return
+		}
+		if debugFrames {
+			fmt.Fprintf(os.Stderr, "PICO-RX cmd=%d id=%d len=%d body=%q\n", h.Command, h.StreamID, h.BodyLen, body)
 		}
 		switch h.Command {
 		case CmdSYN:
