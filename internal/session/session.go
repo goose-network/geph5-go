@@ -103,6 +103,13 @@ func NewManager(cfg *config.Config, authMgr *auth.Manager, broker *brokerproto.B
 			m.brokerKeys = &dialer.BrokerKeys{Master: cfg.BrokerKeys.Master}
 		}
 	}
+	// Default unset session metadata to JSON null here, before any worker
+	// goroutine exists. runSessionOnce and fetchDialer read sessMetadata
+	// concurrently from the session workers without m.mu, so defaulting it
+	// lazily there (as this used to) was a data race on the plain field.
+	if len(m.sessMetadata) == 0 {
+		m.sessMetadata = json.RawMessage("null")
+	}
 	return m
 }
 
@@ -235,11 +242,8 @@ func (m *Manager) runSessionOnce(ctx, dialCtx context.Context, id int) error {
 	// Register the session metadata (Rust: "we first register the session
 	// metadata" — the first JSON-metadata stream on each session). The exit
 	// only accepts tunnel-command streams once this is registered; without it
-	// the first tunnel open would be swallowed as metadata. Default to JSON
-	// null when sess_metadata is unset, matching serde_json::Value::default().
-	if len(m.sessMetadata) == 0 {
-		m.sessMetadata = json.RawMessage("null")
-	}
+	// the first tunnel open would be swallowed as metadata. The null default
+	// is applied in NewManager so this is a plain read of an immutable field.
 	if metaStream, err := mux.Open(m.sessMetadata); err == nil {
 		// The exit reads and discards the metadata stream; close ours so its
 		// handler completes instead of lingering.
