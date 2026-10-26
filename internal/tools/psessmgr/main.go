@@ -38,7 +38,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	mgr := session.NewManager(cfg, nil, nil, db)
+	mgr := session.NewManager(cfg, nil, nil, db, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go mgr.Run(ctx)

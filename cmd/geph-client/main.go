@@ -36,9 +36,9 @@ import (
 	"github.com/geph-official/geph5-go/internal/database"
 	"github.com/geph-official/geph5-go/internal/frontedhttp"
 	"github.com/geph-official/geph5-go/internal/nanorpc"
+	"github.com/geph-official/geph5-go/internal/pac"
 	"github.com/geph-official/geph5-go/internal/portforward"
 	"github.com/geph-official/geph5-go/internal/proxy/http"
-	"github.com/geph-official/geph5-go/internal/pac"
 	"github.com/geph-official/geph5-go/internal/proxy/socks5"
 	"github.com/geph-official/geph5-go/internal/session"
 	"github.com/geph-official/geph5-go/internal/vpn"
@@ -78,7 +78,7 @@ func main() {
 
 	// Construct the auth manager and session manager.
 	authMgr := auth.NewManager(cfg, db, broker)
-	sessMgr := session.NewManager(cfg, authMgr, broker, db)
+	sessMgr := session.NewManager(cfg, authMgr, broker, db, nil)
 
 	// Top-level context canceled on SIGINT/SIGTERM.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -146,11 +146,11 @@ func main() {
 	// Build the control RPC service. LiveInfos feeds conn_info; Stop terminates
 	// the process (after a 100ms delay handled inside the control package).
 	controlSvc := control.New(control.Deps{
-		LiveInfos:  sessMgr.LiveSessionInfos,
-		Broker:     broker,
-		DryRun:     cfg.DryRun,
-		StartTime:  time.Now(),
-		Stop:       func() { cancel() },
+		LiveInfos: sessMgr.LiveSessionInfos,
+		Broker:    broker,
+		DryRun:    cfg.DryRun,
+		StartTime: time.Now(),
+		Stop:      func() { cancel() },
 	})
 
 	// Resolve optional listen addresses.
@@ -249,7 +249,7 @@ func brokerTransportFromSource(src *config.BrokerSource) (nanorpc.RpcTransport, 
 	switch src.Kind {
 	case "direct":
 		// Direct broker URL, no domain fronting.
-		t, err := frontedhttp.New(src.Direct, "", nil)
+		t, err := frontedhttp.New(src.Direct, "", nil, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -258,7 +258,7 @@ func brokerTransportFromSource(src *config.BrokerSource) (nanorpc.RpcTransport, 
 		if src.Fronted == nil {
 			return nil, fmt.Errorf("fronted broker source missing payload")
 		}
-		t, err := frontedhttp.New(src.Fronted.Front, src.Fronted.Host, src.Fronted.OverrideDNS)
+		t, err := frontedhttp.New(src.Fronted.Front, src.Fronted.Host, src.Fronted.OverrideDNS, nil)
 		if err != nil {
 			return nil, err
 		}

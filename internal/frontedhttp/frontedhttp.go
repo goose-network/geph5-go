@@ -30,20 +30,31 @@ import (
 
 // Transport is a fronted-HTTP nanorpc transport.
 type Transport struct {
-	FrontURL string // e.g. https://kubernetes.io/
-	Host     string // real broker host (Host header); empty = no fronting
+	FrontURL    string   // e.g. https://kubernetes.io/
+	Host        string   // real broker host (Host header); empty = no fronting
 	OverrideDNS []string // "ip:port" to pin DNS resolution of the front; empty = system DNS
-	client  *http.Client
+	client      *http.Client
 }
 
 // New creates a Transport. A shared http.Client is built per transport so
-// that OverrideDNS can be applied via a custom Dialer.
-func New(frontURL, host string, overrideDNS []string) (*Transport, error) {
+// that OverrideDNS can be applied via a custom Dialer. stackDialer, when
+// non-nil, establishes the raw TCP connection for every request (to the
+// front host, or the OverrideDNS pin when set) — the embedding process's
+// network stack; nil is the system dialer.
+func New(frontURL, host string, overrideDNS []string, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) (*Transport, error) {
 	t := &Transport{FrontURL: frontURL, Host: host, OverrideDNS: overrideDNS}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	transport := &http.Transport{
-		Proxy:           nil, // no_proxy equivalent
+		Proxy:             nil, // no_proxy equivalent
 		ForceAttemptHTTP2: true,
+	}
+	// rawDial is the raw TCP hop beneath HTTP: the stack dialer when the
+	// embedder supplied one, else the system dialer.
+	rawDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if stackDialer != nil {
+			return stackDialer(ctx, network, addr)
+		}
+		return dialer.DialContext(ctx, network, addr)
 	}
 	if len(overrideDNS) > 0 {
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -56,10 +67,10 @@ func New(frontURL, host string, overrideDNS []string) (*Transport, error) {
 				_, port, _ := net.SplitHostPort(addr)
 				target = net.JoinHostPort(target, port)
 			}
-			return dialer.DialContext(ctx, network, target)
+			return rawDial(ctx, network, target)
 		}
 	} else {
-		transport.DialContext = dialer.DialContext
+		transport.DialContext = rawDial
 	}
 	t.client = &http.Client{Transport: transport, Timeout: 60 * time.Second}
 	return t, nil

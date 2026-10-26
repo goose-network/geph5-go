@@ -4,9 +4,9 @@
 // geph5 client to a REAL geph5 exit (the Rust geph5-exit binary) and pushes
 // real HTTP traffic through the full stack:
 //
-//	HTTP client → SOCKS5 CONNECT → embedded client (provider) →
-//	  session manager → X25519+ed25519 handshake → picomux tunnel →
-//	  Rust geph5-exit c2e listener → target HTTP server
+//	HTTP client → "geph" outbound DialContext (in process) → embedded client
+//	  (provider) → session manager → X25519+ed25519 handshake → picomux
+//	  tunnel → Rust geph5-exit c2e listener → target HTTP server
 //
 // Gated behind the "geph_real" build tag because it needs the exit binary; run
 // it with:
@@ -126,18 +126,23 @@ city: test
 
 	// 4. Start the geph provider pointing at the exit via the direct constraint
 	//    (no broker needed on either side).
-	p, err := New(map[string]any{
+	p, err := NewProvider(map[string]any{
 		"exit_constraint": map[string]any{"direct": fmt.Sprintf("127.0.0.1:%d/%s", c2e, pubHex)},
 		"secret":          "test-geph-plugin",
 	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewProvider: %v", err)
 	}
-	defer p.(*Provider).Close()
+	defer p.Close()
 
-	// 5. Wait for the ready flip (listener bound + live session through the
-	//    real handshake) and grab the advertised outbound.
-	var outbound pub.OutboundConfig
+	// 5. Wait for the ready flip (live session through the real handshake) and
+	//    build the "geph" outbound from the advertised config — exactly what
+	//    the engine's router does.
+	factory, ok := pub.Lookup("geph")
+	if !ok {
+		t.Fatal(`outbound protocol "geph" not registered`)
+	}
+	var ob pub.Outbound
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		outs, err := p.Outbounds(context.Background())
@@ -145,26 +150,25 @@ city: test
 			t.Fatalf("Outbounds: %v", err)
 		}
 		if len(outs) > 0 {
-			outbound = outs[0]
+			ob, err = factory(outs[0].Config)
+			if err != nil {
+				t.Fatalf("outbound factory: %v", err)
+			}
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if outbound.ID == "" {
+	if ob == nil {
 		t.Fatal("provider never became ready (no live session to the exit)")
 	}
-	t.Logf("provider ready: outbound %s %s %v", outbound.ID, outbound.Protocol, outbound.Config)
-	addr, _ := outbound.Config["address"].(string)
-	if addr == "" {
-		t.Fatalf("outbound has no address: %v", outbound.Config)
-	}
+	t.Logf("provider ready: outbound %s (%s)", ob.ID(), ob.Address())
 
-	// 6. Push a real HTTP request through the client's SOCKS5 listener — this
-	//    exercises the full tunnel: SOCKS5 CONNECT → session OpenConn →
+	// 6. Push a real HTTP request through the in-process dial path — this
+	//    exercises the full tunnel: outbound DialContext → session OpenConn →
 	//    picomux stream + RichTunnelCommand → encrypted records → exit →
-	//    target. The CONNECT target is sent as an ATYP=3 domain so the
-	//    IPv4-mapped literal survives to the exit's resolver.
-	body := httpGetViaSocks5(t, addr, mappedV4Loopback, int(targetPort), "/via-geph", targetAddr)
+	//    target. The dial target uses the IPv4-mapped literal so it survives
+	//    to the exit's resolver (see mappedV4Loopback).
+	body := httpGetViaOutbound(t, ob, mappedV4Loopback, int(targetPort), "/via-geph", targetAddr)
 	if string(body) != "geph-e2e:/via-geph" {
 		t.Fatalf("body = %q", string(body))
 	}
@@ -172,7 +176,7 @@ city: test
 
 	// 7. A 192 KiB response exercises multi-frame relaying (MSS-sized PSH
 	//    frames + MORE flow control) in both directions.
-	got := httpGetViaSocks5(t, addr, mappedV4Loopback, int(targetPort), "/big", targetAddr)
+	got := httpGetViaOutbound(t, ob, mappedV4Loopback, int(targetPort), "/big", targetAddr)
 	if !bytesEqual(got, bigBody) {
 		t.Fatalf("big body mismatch: got %d bytes, want %d", len(got), len(bigBody))
 	}
@@ -188,7 +192,7 @@ city: test
 		}
 		var portNum int
 		fmt.Sscanf(port, "%d", &portNum)
-		body, status := httpGetViaSocks5Status(t, addr, host, portNum, "/", realTarget)
+		body, status := httpGetViaOutboundStatus(t, ob, host, portNum, "/", realTarget)
 		t.Logf("real-internet body via %s: status %d, %d bytes, starts %q", realTarget, status, len(body), string(body[:min(len(body), 40)]))
 		if status < 200 || status >= 600 {
 			t.Fatalf("real target %s returned invalid status %d", realTarget, status)
@@ -196,7 +200,7 @@ city: test
 	}
 }
 
-// The shared SOCKS5/HTTP helpers this test uses (httpGetViaSocks5,
+// The shared HTTP-over-outbound helpers this test uses (httpGetViaOutbound,
 // bigResponseBody, ...) live in helpers_test.go, which is untagged so the
 // standalone embedded-exit test can use them too.
 

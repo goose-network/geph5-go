@@ -3,12 +3,19 @@
 // wire-compatible Go port of the geph5 client core — as a library and exposes
 // it to goose the same way the Tor provider embeds tor-go: the provider boots
 // the full geph5 client (auth loop, session manager with its 6 concurrent
-// tunnels, SOCKS5 listener) in the background, and once the client's listener
-// is bound and at least one session to a geph5 exit is live, it emits ONE goose
-// outbound of protocol "socks5" pointing at the client's loopback SOCKS5
-// listener. The engine merges that outbound into the provider's managed pool,
-// so any goose inbound routed through the pool forwards traffic through real
-// geph5 tunnels.
+// tunnels) in the background, and once at least one session to a geph5 exit
+// is live, it emits ONE goose outbound of protocol "geph". A dial through
+// that outbound is an in-process call into the client — the outbound invokes
+// the session manager's open-conn path directly — so there is no SOCKS/HTTP
+// hop between goose and the embedded client; the client binds no listener at
+// all.
+//
+// The client's own TCP — broker RPCs (including domain-fronted ones) and the
+// compiled route tree to the exit (sosistab3, plain TLS, meeklike, TCP
+// hops) — dials through the engine's layer-3/4 stack: the engine injects its
+// stack dialer under goose-plugin-api's StackDialerKey, and the plugin hands
+// it to clientlib as Options.StackDialer, which threads it down to every
+// BoundTcpDialer and the broker transport.
 //
 // This package lives inside the geph5-go module (not a separate repo) because
 // it embeds geph5-go's internal packages (internal/clientlib → internal/auth,
@@ -38,8 +45,6 @@
 //	{
 //	  "config_path":  "/path/to/geph5.yaml",     // optional: full client YAML
 //	                                             // (config.LoadYAML format)
-//	  "socks_listen": "127.0.0.1:0",             // client listener (default
-//	                                             // ephemeral loopback)
 //	  "embedded_exit": true,                     // run the exit in-process
 //	  "outbound_id":  "geph",                    // goose outbound id
 //	  "exit_constraint": {"direct": "host:port/<exit-pubkey-hex>"},
@@ -56,7 +61,7 @@
 //
 // "config_path" loads the full client YAML; the inline keys (when present)
 // are applied on top, so a static YAML can be reused while the plugin
-// overrides the listener and exit constraint.
+// overrides the exit constraint.
 //
 // # Standalone mode (embedded exit)
 //
@@ -83,6 +88,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
+	"net"
 	"sync"
 	"time"
 
@@ -95,7 +102,37 @@ import (
 )
 
 func init() {
-	pub.RegisterProvider("geph", New)
+	pub.RegisterProvider("geph", NewProvider)
+}
+
+// liveProviders holds the running geph providers keyed by their contributed
+// outbound id, mirroring plugins/tor. The "geph" outbound protocol resolves
+// its tunnel at dial time through this table, so the emitted outbound config
+// needs no addresses and stays valid across provider restarts: an old
+// instance's Close uses CompareAndDelete, so it never clobbers a newer
+// provider registered under the same id (the engine enforces unique outbound
+// ids, so the key is unambiguous).
+var liveProviders sync.Map // map[string]*Provider
+
+func registerLiveProvider(p *Provider)   { liveProviders.Store(p.cfg.OutboundID, p) }
+func unregisterLiveProvider(p *Provider) { liveProviders.CompareAndDelete(p.cfg.OutboundID, p) }
+func lookupLiveProvider(id string) (*Provider, bool) {
+	v, ok := liveProviders.Load(id)
+	if !ok {
+		return nil, false
+	}
+	p, ok := v.(*Provider)
+	return p, ok
+}
+
+// clientConn is the clientlib.Client surface the provider needs: dialing in
+// process, session counting, and shutdown. *clientlib.Client implements it;
+// the interface keeps the dial path testable without booting a full session
+// stack (mirroring plugins/tor's streamDialer seam).
+type clientConn interface {
+	OpenConn(ctx context.Context, remote string) (net.Conn, error)
+	SessionCount() int
+	Close()
 }
 
 // Provider is a goose outbound provider backed by an embedded geph5 client.
@@ -104,12 +141,11 @@ type Provider struct {
 	cfg providerConfig
 
 	// client state, guarded by mu
-	mu        sync.Mutex
-	ready     bool   // listener bound AND a live session tunnel exists
-	socksAddr string // the embedded client's SOCKS5 listener address
-	startErr  error  // terminal startup error, surfaced via Outbounds
-	client    *clientlib.Client
-	exit      *exitlib.Exit // non-nil in standalone (embedded_exit) mode
+	mu       sync.Mutex
+	ready    bool          // a live session tunnel exists
+	startErr error         // terminal startup error, surfaced via Outbounds
+	client   clientConn    // the embedded client (dials in process; no listener)
+	exit     *exitlib.Exit // non-nil in standalone (embedded_exit) mode
 
 	// watch signals the engine that the outbound set changed (ready flip).
 	watchCh chan struct{}
@@ -122,7 +158,6 @@ type Provider struct {
 // providerConfig is the deserialized provider config.
 type providerConfig struct {
 	ConfigPath     string          `json:"config_path"`
-	SocksListen    string          `json:"socks_listen"`
 	OutboundID     string          `json:"outbound_id"`
 	ExitConstraint json.RawMessage `json:"exit_constraint"`
 	Credentials    json.RawMessage `json:"credentials"`
@@ -182,16 +217,27 @@ func (o embeddedExitOptions) exitlibOptions() (exitlib.Options, error) {
 	return opts, nil
 }
 
-// New is the ProviderFactory registered as "geph". It parses the config and
-// starts the geph5 client bootstrap in the background; Outbounds returns a
-// socks5 outbound once the client has a live session, and an empty set before.
-func New(cfg map[string]any) (pub.Provider, error) {
+// NewProvider is the ProviderFactory registered as "geph". It parses the
+// config and starts the geph5 client bootstrap in the background; Outbounds
+// returns a "geph" outbound once the client has a live session, and an empty
+// set before.
+func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	pc, err := parseConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
 	if pc.OutboundID == "" {
 		pc.OutboundID = "geph"
+	}
+
+	// Route the client's own TCP (broker, exit route tree) through the
+	// engine's layer-3/4 stack — the system kernel or gvisor netstack —
+	// rather than the raw system dialer. The engine injects its dialer under
+	// pub.StackDialerKey; when absent (e.g. unit tests) the client falls back
+	// to the system dialer.
+	var stackDialer func(ctx context.Context, network, address string) (net.Conn, error)
+	if sd := pub.AsStackDialer(cfg); sd != nil {
+		stackDialer = sd.Dial
 	}
 
 	p := &Provider{
@@ -203,13 +249,34 @@ func New(cfg map[string]any) (pub.Provider, error) {
 	p.stop = cancel
 	go func() {
 		defer close(p.stopped)
-		p.run(ctx)
+		p.run(ctx, stackDialer)
 	}()
+	registerLiveProvider(p)
 	return p, nil
 }
 
-// parseConfig marshals the plugin config map into providerConfig.
+// dialConn is the in-memory dial entry for the "geph" outbound protocol: it
+// opens a connection to remote through the live session manager — the same
+// path the SOCKS5 listener hands CONNECTs to, called directly.
+func (p *Provider) dialConn(ctx context.Context, remote string) (net.Conn, error) {
+	p.mu.Lock()
+	client := p.client
+	ready := p.ready
+	p.mu.Unlock()
+	if client == nil || !ready {
+		return nil, fmt.Errorf("geph provider: no live session (client not running or still establishing)")
+	}
+	return client.OpenConn(ctx, remote)
+}
+
+// parseConfig marshals the plugin config map into providerConfig. The
+// engine-injected dialer values (func/interface under the reserved
+// "_dialer"/"_upstream_dialer" keys) are dropped first: they are consumed
+// via AsStackDialer in NewProvider, and json.Marshal would choke on them.
 func parseConfig(cfg map[string]any) (providerConfig, error) {
+	cfg = maps.Clone(cfg)
+	delete(cfg, pub.StackDialerKey)
+	delete(cfg, pub.UpstreamDialerKey)
 	if cfg == nil {
 		return providerConfig{}, nil
 	}
@@ -339,23 +406,12 @@ func quoteJSONString(s string) string {
 	return string(b)
 }
 
-// sessionReadyAddr returns the SOCKS5 listener address to advertise once the
-// client reports a live session, else "".
-func (p *Provider) sessionReadyAddr() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if !p.ready {
-		return ""
-	}
-	return p.socksAddr
-}
-
 // run starts the embedded geph5 client and waits for its first live session,
 // updating the provider's ready state as things change. It blocks until ctx
 // is canceled; clientlib owns the client's internal retry semantics, so
 // unlike the tor provider there is no backoff loop here — the session manager
 // already retries tunnel establishment forever.
-func (p *Provider) run(ctx context.Context) {
+func (p *Provider) run(ctx context.Context, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) {
 	clientCfg, err := buildClientConfig(p.cfg)
 	if err != nil {
 		p.setTerminal(err)
@@ -393,9 +449,13 @@ func (p *Provider) run(ctx context.Context) {
 		}
 	}
 
+	// NoListener: nothing binds — the "geph" outbound dials the session
+	// manager in process via Client.OpenConn. stackDialer carries the
+	// engine's network stack into the client's own connections.
 	client, err := clientlib.Start(ctx, clientlib.Options{
-		Socks5Listen: p.cfg.SocksListen,
-		Config:       clientCfg,
+		NoListener:  true,
+		StackDialer: stackDialer,
+		Config:      clientCfg,
 	})
 	if err != nil {
 		p.setTerminal(err)
@@ -403,12 +463,13 @@ func (p *Provider) run(ctx context.Context) {
 	}
 	p.mu.Lock()
 	p.client = client
-	addr := client.SocksAddr()
 	p.mu.Unlock()
 
-	// The listener is already bound; wait for a live session (the first tunnel
-	// through which traffic can actually flow) before advertising readiness.
-	if err := p.awaitSession(ctx, client, addr); err != nil {
+	// Wait for a live session (the first tunnel through which traffic can
+	// actually flow) before advertising readiness: without one, every dial
+	// would fail, and advertising early would let the engine hammer a dead
+	// tunnel.
+	if err := p.awaitSession(ctx, client); err != nil {
 		if ctx.Err() != nil {
 			return
 		}
@@ -417,17 +478,15 @@ func (p *Provider) run(ctx context.Context) {
 	}
 
 	// Sessions may come and go; keep the outbound advertised as long as the
-	// client (listener) is up, mirroring how tor's provider advertises as long
-	// as its listener is up. SetLiveness ping failures inside a session cause
+	// client is up, mirroring how tor's provider advertises as long as its
+	// guard link is alive. SetLiveness ping failures inside a session cause
 	// the session worker to rebuild tunnels automatically.
 	<-ctx.Done()
 }
 
 // awaitSession polls the session manager until at least one session is live
-// (so tunnels can carry data), or ctx is canceled. The SOCKS5 listener is
-// bound, but without a live tunnel every CONNECT would fail; advertising the
-// outbound before a tunnel exists would let the engine hammer a dead proxy.
-func (p *Provider) awaitSession(ctx context.Context, client *clientlib.Client, socksAddr string) error {
+// (so tunnels can carry data), or ctx is canceled.
+func (p *Provider) awaitSession(ctx context.Context, client clientConn) error {
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
 		if ctx.Err() != nil {
@@ -436,14 +495,13 @@ func (p *Provider) awaitSession(ctx context.Context, client *clientlib.Client, s
 		if client.SessionCount() > 0 {
 			p.mu.Lock()
 			p.ready = true
-			p.socksAddr = socksAddr
 			p.mu.Unlock()
-			log.Printf("geph provider: geph5 client serving SOCKS5 at %s", socksAddr)
+			log.Printf("geph provider: geph5 client has a live session")
 			p.signalWatch()
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("geph provider: timed out waiting for a live session (listener at %s)", socksAddr)
+			return fmt.Errorf("geph provider: timed out waiting for a live session")
 		}
 		select {
 		case <-ctx.Done():
@@ -469,39 +527,38 @@ func (p *Provider) Name() string { return "geph" }
 func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 
 // Outbounds returns the current outbound set: empty until the geph5 client
-// has a live session, then a single socks5 outbound pointing at its loopback
-// SOCKS5 listener. A terminal startup failure returns the error so the engine
-// logs it (the existing pool, if any, is kept).
+// has a live session, then a single "geph" outbound, which dials through this
+// provider in process. A terminal startup failure returns the error so the
+// engine logs it (the existing pool, if any, is kept).
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	p.mu.Lock()
 	ready := p.ready
-	addr := p.socksAddr
 	err := p.startErr
 	id := p.cfg.OutboundID
 	p.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	if !ready || addr == "" {
+	if !ready {
 		return nil, nil
 	}
 	return []pub.OutboundConfig{
 		{
 			ID:       id,
-			Protocol: "socks5",
+			Protocol: "geph",
 			Config: map[string]any{
-				"id":      id,
-				"address": addr,
+				"id":     id,
+				"tunnel": id,
 			},
 		},
 	}, nil
 }
 
-// Close stops the embedded exit (standalone mode), the embedded geph5
-// client, and the run goroutine. The engine's provider manager does not call
-// Close on providers; this exists for embedders and tests that manage the
-// provider lifecycle themselves.
+// Close stops the embedded exit (standalone mode), the embedded geph5 client,
+// and the run goroutine, then drops the live-provider registration so dials
+// for this id fail fast instead of finding a dead provider.
 func (p *Provider) Close() error {
+	unregisterLiveProvider(p)
 	if p.stop != nil {
 		p.stop()
 	}
@@ -514,6 +571,7 @@ func (p *Provider) Close() error {
 	}
 	if p.client != nil {
 		p.client.Close()
+		p.client = nil
 	}
 	p.mu.Unlock()
 	return nil

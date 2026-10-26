@@ -70,19 +70,19 @@ func TestCombineExitRouteWrapsDirectPath(t *testing.T) {
 
 func TestRouteToDialerKinds(t *testing.T) {
 	// tcp -> BoundTcpDialer
-	d := routeToDialer(&brokerproto.RouteDescriptor{Kind: "tcp", TcpAddr: "1.2.3.4:80"})
+	d := routeToDialer(&brokerproto.RouteDescriptor{Kind: "tcp", TcpAddr: "1.2.3.4:80"}, nil)
 	if _, ok := d.(BoundTcpDialer); !ok {
 		t.Fatalf("tcp route should compile to BoundTcpDialer, got %T", d)
 	}
 
 	// other -> FailingDialer
-	d = routeToDialer(&brokerproto.RouteDescriptor{Kind: "other", Other: []byte("null")})
+	d = routeToDialer(&brokerproto.RouteDescriptor{Kind: "other", Other: []byte("null")}, nil)
 	if _, ok := d.(sillad.FailingDialer); !ok {
 		t.Fatalf("other route should compile to FailingDialer, got %T", d)
 	}
 
 	// unknown -> FailingDialer
-	d = routeToDialer(&brokerproto.RouteDescriptor{Kind: "wat"})
+	d = routeToDialer(&brokerproto.RouteDescriptor{Kind: "wat"}, nil)
 	if _, ok := d.(sillad.FailingDialer); !ok {
 		t.Fatalf("unknown route should compile to FailingDialer, got %T", d)
 	}
@@ -92,7 +92,7 @@ func TestRouteToDialerKinds(t *testing.T) {
 		{Kind: "tcp", TcpAddr: "1.1.1.1:1"},
 		{Kind: "tcp", TcpAddr: "2.2.2.2:2"},
 	}}
-	d = routeToDialer(&race)
+	d = routeToDialer(&race, nil)
 	rd, ok := d.(sillad.RaceDialer)
 	if !ok {
 		t.Fatalf("race route should compile to RaceDialer, got %T", d)
@@ -102,7 +102,7 @@ func TestRouteToDialerKinds(t *testing.T) {
 	}
 
 	// empty race -> FailingDialer
-	d = routeToDialer(&brokerproto.RouteDescriptor{Kind: "race"})
+	d = routeToDialer(&brokerproto.RouteDescriptor{Kind: "race"}, nil)
 	if _, ok := d.(sillad.FailingDialer); !ok {
 		t.Fatalf("empty race should compile to FailingDialer, got %T", d)
 	}
@@ -112,7 +112,7 @@ func TestRouteToDialerKinds(t *testing.T) {
 		{Kind: "tcp", TcpAddr: "1.1.1.1:1"},
 		{Kind: "tcp", TcpAddr: "2.2.2.2:2"},
 	}}
-	d = routeToDialer(&fb)
+	d = routeToDialer(&fb, nil)
 	fd, ok := d.(sillad.FallbackDialer)
 	if !ok {
 		t.Fatalf("fallback route should compile to FallbackDialer, got %T", d)
@@ -124,7 +124,7 @@ func TestRouteToDialerKinds(t *testing.T) {
 	// timeout -> TimeoutDialer
 	tcpLower := brokerproto.RouteDescriptor{Kind: "tcp", TcpAddr: "1.2.3.4:80"}
 	to := brokerproto.RouteDescriptor{Kind: "timeout", Milliseconds: 500, Lower: &tcpLower}
-	d = routeToDialer(&to)
+	d = routeToDialer(&to, nil)
 	td, ok := d.(sillad.TimeoutDialer)
 	if !ok {
 		t.Fatalf("timeout route should compile to TimeoutDialer, got %T", d)
@@ -135,7 +135,7 @@ func TestRouteToDialerKinds(t *testing.T) {
 
 	// delay -> DelayDialer
 	dl := brokerproto.RouteDescriptor{Kind: "delay", Milliseconds: 1000, Lower: &tcpLower}
-	d = routeToDialer(&dl)
+	d = routeToDialer(&dl, nil)
 	dd, ok := d.(sillad.DelayDialer)
 	if !ok {
 		t.Fatalf("delay route should compile to DelayDialer, got %T", d)
@@ -146,15 +146,19 @@ func TestRouteToDialerKinds(t *testing.T) {
 
 	// conntest -> conntest.Dialer
 	ct := brokerproto.RouteDescriptor{Kind: "conntest", PingCount: 3, Lower: &tcpLower}
-	d = routeToDialer(&ct)
-	if _, ok := d.(interface{ Dial(context.Context) (sillad.Pipe, error) }); !ok {
+	d = routeToDialer(&ct, nil)
+	if _, ok := d.(interface {
+		Dial(context.Context) (sillad.Pipe, error)
+	}); !ok {
 		t.Fatalf("conntest route should compile to a Dialer, got %T", d)
 	}
 
 	// hex -> hexdialer.Dialer
 	hx := brokerproto.RouteDescriptor{Kind: "hex", Lower: &tcpLower}
-	d = routeToDialer(&hx)
-	if _, ok := d.(interface{ Dial(context.Context) (sillad.Pipe, error) }); !ok {
+	d = routeToDialer(&hx, nil)
+	if _, ok := d.(interface {
+		Dial(context.Context) (sillad.Pipe, error)
+	}); !ok {
 		t.Fatalf("hex route should compile to a Dialer, got %T", d)
 	}
 }
@@ -164,7 +168,7 @@ func TestGetDialerDirectParsesPubkey(t *testing.T) {
 	// by calling getDialerDirect, which resolves the host but does not connect).
 	// Use an IP literal so no DNS lookup is needed.
 	pubkeyHex := "0000000000000000000000000000000000000000000000000000000000000000"
-	pub, exit, dialer, err := getDialerDirect(t.Context(), "127.0.0.1:9999/"+pubkeyHex)
+	pub, exit, dialer, err := getDialerDirect(t.Context(), "127.0.0.1:9999/"+pubkeyHex, nil)
 	if err != nil {
 		t.Fatalf("getDialerDirect failed: %v", err)
 	}
@@ -181,15 +185,15 @@ func TestGetDialerDirectParsesPubkey(t *testing.T) {
 
 func TestGetDialerDirectRejectsBadPubkey(t *testing.T) {
 	// Missing / separator.
-	if _, _, _, err := getDialerDirect(t.Context(), "127.0.0.1:9999"); err == nil {
+	if _, _, _, err := getDialerDirect(t.Context(), "127.0.0.1:9999", nil); err == nil {
 		t.Fatal("expected error for missing / in direct constraint")
 	}
 	// Bad hex.
-	if _, _, _, err := getDialerDirect(t.Context(), "127.0.0.1:9999/zz"); err == nil {
+	if _, _, _, err := getDialerDirect(t.Context(), "127.0.0.1:9999/zz", nil); err == nil {
 		t.Fatal("expected error for bad hex pubkey")
 	}
 	// Wrong length (not 32 bytes).
-	if _, _, _, err := getDialerDirect(t.Context(), "127.0.0.1:9999/00"); err == nil {
+	if _, _, _, err := getDialerDirect(t.Context(), "127.0.0.1:9999/00", nil); err == nil {
 		t.Fatal("expected error for wrong-length pubkey")
 	}
 }

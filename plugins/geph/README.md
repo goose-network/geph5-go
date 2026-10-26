@@ -4,18 +4,27 @@ This package is the [goose](https://github.com/goose-network/goose) proxy-pool
 engine's **geph provider plugin**: it embeds the geph5-go client core as a
 library and exposes it to goose as a dynamic source of outbounds. Once the
 embedded client has a live tunnel to a geph5 exit, the provider advertises one
-`socks5` outbound pointing at the client's loopback SOCKS5 listener; goose
-merges it into the provider's managed pool, and every inbound routed through
-that pool forwards traffic through real geph5 tunnels:
+`geph`-protocol outbound; a dial through it opens a tunnel stream **in
+process** — the outbound calls the session manager's open-conn path directly —
+so no SOCKS/HTTP hop exists between goose and the embedded client, and the
+client binds no listener at all:
 
 ```
-goose inbound ──▶ pool (managed by provider) ──▶ socks5 ──▶ embedded geph5 client
-                                                                        │
-                                            session manager: 6 tunnels, X25519+ed25519
-                                            handshake, picomux, sosistab3
-                                                                        │
-                                                              Rust geph5-exit ──▶ internet
+goose inbound ──▶ pool ──▶ "geph" outbound ──▶ OpenConn (in process, no listener)
+                                            │
+                        embedded geph5 client: session manager, 6 tunnels,
+                        X25519+ed25519 handshake, picomux, sosistab3
+                                            │
+                              Rust geph5-exit ──▶ internet
 ```
+
+The client's own TCP — broker RPCs (including domain-fronted ones) and the
+compiled route tree to the exit — dials through **goose's layer-3/4 stack**
+(the system kernel stack or the gvisor netstack): the engine injects its stack
+dialer into the provider config (`goose-plugin-api`'s `StackDialer`), and the
+plugin hands it to the client as `clientlib.Options.StackDialer`, which
+threads it down to every TCP dialer in the route tree and the broker
+transport.
 
 With the `embedded_exit` option the last hop changes: a **Go** geph5 exit
 (`geph5-go`'s `internal/exitlib`) runs inside the provider's own process, so
@@ -37,9 +46,9 @@ the exit, completing the X25519+ed25519 handshake, and registering the tunnel �
 work the session manager does on its own schedule. The provider therefore
 starts the client in a background goroutine from the factory:
 
-- `Outbounds()` returns an **empty set** until the SOCKS5 listener is bound
-  *and* at least one session is live, then signals `Watch()` so the engine
-  repolls promptly instead of waiting for the 2-minute fallback poll.
+- `Outbounds()` returns an **empty set** until at least one session is live,
+  then signals `Watch()` so the engine repolls promptly instead of waiting for
+  the 2-minute fallback poll.
 - A failed session (broker unreachable, exit down) is retried indefinitely
   inside the session manager; the provider's only terminal error paths are an
   invalid config (fails the factory) and a 5-minute timeout waiting for the
@@ -53,7 +62,6 @@ config where they make sense as provider knobs:
 ```json
 {
   "config_path":     "/path/to/geph5.yaml",
-  "socks_listen":    "127.0.0.1:0",
   "embedded_exit":   true,
   "outbound_id":     "geph",
   "exit_constraint": { "direct": "host:port/<exit-pubkey-hex>" },
@@ -67,9 +75,8 @@ config where they make sense as provider knobs:
 | Key | Default | Meaning |
 |---|---|---|
 | `config_path` | — | Full client YAML (`config.LoadYAML` format; see the module README) as the base config. |
-| `socks_listen` | `127.0.0.1:0` | Address for the embedded client's SOCKS5 listener; `:0` picks an ephemeral loopback port. |
 | `embedded_exit` | — | Standalone mode: boot the geph5 exit in-process (see below). `true` or `{ "listen", "allow_loopback", "seed_hex" }`. |
-| `outbound_id` | `geph` | The goose outbound id the provider advertises. |
+| `outbound_id` | `geph` | The goose outbound id the provider advertises; the `"geph"` outbound resolves its tunnel by this id at dial time. |
 | `exit_constraint` | — | The client's exit constraint in its native enum shape: `"auto"`, `{"direct": "host:port/pubkeyhex"}`, `{"hostname": "..."}`, etc. |
 | `credentials` | — | Full credential object, when a broker is used (`{"secret": ...}`, `"test_dummy"`, or `{"legacy_username_password": {...}}`). |
 | `secret` | — | Shorthand for `credentials: {secret: ...}`. |
@@ -79,8 +86,8 @@ config where they make sense as provider knobs:
 | `broker_keys` | — | Broker verification keys, required with a broker. |
 
 `config_path` loads a static YAML; the inline keys (when present) are applied on
-top of it, so a shared YAML can be reused while the plugin overrides the
-listener or exit constraint.
+top of it, so a shared YAML can be reused while the plugin overrides the exit
+constraint.
 
 Three shapes cover the common cases:
 
@@ -169,11 +176,14 @@ through the tunnels.
 
 ## Tests
 
-Unit tests (`go test ./plugins/geph/`) cover config parsing and registration
-with no network. The standalone test (`TestGephProviderStandalone`, no build
-tag, part of the default suite) boots the provider with `embedded_exit` and
-pushes HTTP — small + 192 KiB multi-frame responses — through the plugin's
-SOCKS5 outbound into the embedded exit, all in one process.
+Unit tests (`go test ./plugins/geph/`) cover config parsing (including
+stripping the engine-injected dialer keys), registration, and the in-memory
+dial path (outbound → live provider → client) with no network. The standalone
+test (`TestGephProviderStandalone`, no build tag, part of the default suite)
+boots the provider with `embedded_exit` and pushes HTTP — small + 192 KiB
+multi-frame responses — through the `"geph"` outbound's in-process dial into
+the embedded exit, all in one process and with no listener anywhere in the
+path.
 
 The real-network test needs a **Rust geph5-exit binary** and is gated behind
 the `geph_real` build tag:

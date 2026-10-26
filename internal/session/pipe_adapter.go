@@ -20,8 +20,8 @@ import (
 // streamPipe adapts a picomux.Stream to sillad.Pipe.
 type streamPipe struct {
 	*picomux.Stream
-	protocol   string
-	remoteStr  string
+	protocol  string
+	remoteStr string
 }
 
 // newStreamPipe wraps s with the given protocol label and remote address

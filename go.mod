@@ -3,7 +3,7 @@ module github.com/geph-official/geph5-go
 go 1.26.0
 
 require (
-	github.com/goose-network/goose-plugin-api v0.0.0-20260923221657-7ba364a3ef3c
+	github.com/goose-network/goose-plugin-api v0.0.0-20261026123131-fb552d7d52b0
 	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/crypto v0.57.0
 	gopkg.in/yaml.v3 v3.0.1

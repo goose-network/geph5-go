@@ -56,14 +56,17 @@ const (
 // Manager owns the session pool and the machinery to establish authenticated
 // tunnels to the exit. It is safe for concurrent use.
 type Manager struct {
-	cfg         *config.Config
-	authMgr     *auth.Manager
-	broker      *brokerproto.BrokerClient
-	db          *database.Database
-	brokerKeys  *dialer.BrokerKeys
+	cfg            *config.Config
+	authMgr        *auth.Manager
+	broker         *brokerproto.BrokerClient
+	db             *database.Database
+	brokerKeys     *dialer.BrokerKeys
 	exitConstraint brokerproto.ExitConstraint
-	allowDirect bool
-	sessMetadata json.RawMessage
+	allowDirect    bool
+	sessMetadata   json.RawMessage
+	// stackDialer, when non-nil, establishes the raw TCP connections to the
+	// exit (see dialer.GetDialer); nil is the system dialer.
+	stackDialer func(ctx context.Context, network, address string) (net.Conn, error)
 
 	mu       sync.Mutex
 	sessions []*sessionSlot
@@ -74,7 +77,7 @@ type Manager struct {
 // sessionSlot holds one connected, authenticated, multiplexed session.
 type sessionSlot struct {
 	mux      *picomux.PicoMux
-	exitInfo string // human-readable label for logging
+	exitInfo string                     // human-readable label for logging
 	exitDesc brokerproto.ExitDescriptor // full exit descriptor (for conn_info)
 	bridge   string                     // bridge SocketAddr string, "" if none
 	// pendingOpens counts in-flight OpenConn calls using this session.
@@ -86,7 +89,9 @@ type sessionSlot struct {
 // NewManager constructs a session Manager bound to the given config, auth
 // manager, broker client, and database. The auth manager supplies connect
 // tokens; the broker client and database feed the route compiler.
-func NewManager(cfg *config.Config, authMgr *auth.Manager, broker *brokerproto.BrokerClient, db *database.Database) *Manager {
+// stackDialer, when non-nil, establishes the raw TCP connections to the exit
+// (the embedding process's network stack); nil is the system dialer.
+func NewManager(cfg *config.Config, authMgr *auth.Manager, broker *brokerproto.BrokerClient, db *database.Database, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) *Manager {
 	m := &Manager{
 		cfg:            cfg,
 		authMgr:        authMgr,
@@ -94,6 +99,7 @@ func NewManager(cfg *config.Config, authMgr *auth.Manager, broker *brokerproto.B
 		db:             db,
 		exitConstraint: brokerproto.AutoConstraint(),
 		allowDirect:    false,
+		stackDialer:    stackDialer,
 	}
 	if cfg != nil {
 		m.exitConstraint = cfg.ExitConstraint
@@ -288,7 +294,7 @@ func (m *Manager) fetchDialer(ctx context.Context) (exitPubkey []byte, exit brok
 			args.Sig = sigJSON
 		}
 	}
-	return dialer.GetDialer(ctx, m.exitConstraint, m.allowDirect, m.brokerKeys, m.broker, m.db, args)
+	return dialer.GetDialer(ctx, m.exitConstraint, m.allowDirect, m.brokerKeys, m.broker, m.db, args, m.stackDialer)
 }
 
 // clientAuth runs the exit handshake. If the transport pipe carries a shared

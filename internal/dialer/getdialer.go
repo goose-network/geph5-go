@@ -30,6 +30,9 @@ import (
 // from get_connect_token / get_device_metadata; here the caller, which owns the
 // auth machinery, passes them in).
 //
+// stackDialer, when non-nil, establishes the raw TCP connections to the exit
+// (see BoundTcpDialer.DialContext); nil dials with the system dialer.
+//
 // Flow:
 //  1. If cfg.ExitConstraint is "direct": parse "host:port/pubkeyhex", resolve
 //     the host, build a ConnTestDialer{ping_count:1, inner: BoundTcpDialer{addr}}.
@@ -50,27 +53,28 @@ func GetDialer(
 	brokerClient *brokerproto.BrokerClient,
 	db *database.Database,
 	exitRouteArgs brokerproto.GetExitRouteArgs,
+	stackDialer func(ctx context.Context, network, address string) (net.Conn, error),
 ) (exitPubkey []byte, exit brokerproto.ExitDescriptor, dialer sillad.Dialer, err error) {
 	// 1. Direct constraint: parse "host:port/pubkeyhex".
 	if cfg.Kind == "direct" {
-		return getDialerDirect(ctx, cfg.Direct)
+		return getDialerDirect(ctx, cfg.Direct, stackDialer)
 	}
 
 	// 2. Try the cached exit route first.
 	cached, cacheErr := routecache.ReadCachedExitRoute(ctx, db, cfg)
 	if cacheErr == nil && cached != nil && exitRouteIsUnexpired(*cached) {
-		return dialerFromExitRoute(*cached, allowDirect)
+		return dialerFromExitRoute(*cached, allowDirect, stackDialer)
 	}
 
 	// 3. Fetch a fresh exit route from the broker.
 	fresh, freshErr := fetchFreshExitRoute(ctx, brokerClient, brokerKeys, db, cfg, exitRouteArgs)
 	if freshErr == nil {
-		return dialerFromExitRoute(fresh, allowDirect)
+		return dialerFromExitRoute(fresh, allowDirect, stackDialer)
 	}
 
 	// 4. Fresh route failed: fall back to the cached route (even if expired).
 	if cacheErr == nil && cached != nil {
-		return dialerFromExitRoute(*cached, allowDirect)
+		return dialerFromExitRoute(*cached, allowDirect, stackDialer)
 	}
 	if cacheErr != nil {
 		return nil, brokerproto.ExitDescriptor{}, nil, fmt.Errorf(
@@ -102,8 +106,8 @@ func BrokerKeysFromMasterHex(masterHex string) *BrokerKeys {
 // getDialerDirect handles the ExitConstraint::Direct case: parse
 // "host:port/pubkeyhex", resolve the host, and build a ConnTestDialer wrapping
 // a BoundTcpDialer. Returns the pubkey, a placeholder ExitDescriptor, and the
-// dialer.
-func getDialerDirect(ctx context.Context, direct string) ([]byte, brokerproto.ExitDescriptor, sillad.Dialer, error) {
+// dialer. stackDialer (when non-nil) becomes the BoundTcpDialer's raw dialer.
+func getDialerDirect(ctx context.Context, direct string, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) ([]byte, brokerproto.ExitDescriptor, sillad.Dialer, error) {
 	dir, pubkeyHex, ok := splitOnce(direct, '/')
 	if !ok {
 		return nil, brokerproto.ExitDescriptor{}, nil, errors.New("dialer: did not find / in a direct constraint")
@@ -124,7 +128,7 @@ func getDialerDirect(ctx context.Context, direct string) ([]byte, brokerproto.Ex
 	// direct_route = ConnTest{ ping_count: 1, lower: Tcp(addr) }
 	dialer := conntest.Dialer{
 		PingCount: 1,
-		Inner:     BoundTcpDialer{DestAddr: addr},
+		Inner:     BoundTcpDialer{DestAddr: addr, DialContext: stackDialer},
 	}
 	placeholder := brokerproto.ExitDescriptor{
 		C2EListen: "0.0.0.0:0",
@@ -188,10 +192,11 @@ func verifyExitRoute(signed *brokerproto.JsonSigned, brokerKeys *BrokerKeys) (br
 }
 
 // dialerFromExitRoute builds the combined route tree and compiles it into a
-// sillad.Dialer. Mirrors dialer_from_exit_route in get_dialer.rs.
-func dialerFromExitRoute(exitRoute brokerproto.ExitRouteDescriptor, allowDirect bool) ([]byte, brokerproto.ExitDescriptor, sillad.Dialer, error) {
+// sillad.Dialer. Mirrors dialer_from_exit_route in get_dialer.rs. stackDialer
+// (when non-nil) is threaded into every TCP dialer the tree compiles to.
+func dialerFromExitRoute(exitRoute brokerproto.ExitRouteDescriptor, allowDirect bool, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) ([]byte, brokerproto.ExitDescriptor, sillad.Dialer, error) {
 	combined := combineExitRoute(exitRoute.Exit, exitRoute.Route, allowDirect)
-	d := routeToDialer(&combined)
+	d := routeToDialer(&combined, stackDialer)
 	return exitRoute.ExitPubkey, exitRoute.Exit, d, nil
 }
 
@@ -217,9 +222,9 @@ func combineExitRoute(exit brokerproto.ExitDescriptor, route brokerproto.RouteDe
 		Lower:     &c2e,
 	}
 	delayed := brokerproto.RouteDescriptor{
-		Kind:        "delay",
+		Kind:         "delay",
 		Milliseconds: 1000,
-		Lower:       &route,
+		Lower:        &route,
 	}
 	return brokerproto.RouteDescriptor{
 		Kind:   "race",
@@ -228,14 +233,15 @@ func combineExitRoute(exit brokerproto.ExitDescriptor, route brokerproto.RouteDe
 }
 
 // routeToDialer recursively compiles a RouteDescriptor tree into a sillad.Dialer.
-// Mirrors route_to_dialer in get_dialer.rs.
-func routeToDialer(route *brokerproto.RouteDescriptor) sillad.Dialer {
+// Mirrors route_to_dialer in get_dialer.rs. stackDialer (when non-nil) is
+// attached to every TCP dialer the tree compiles to.
+func routeToDialer(route *brokerproto.RouteDescriptor, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) sillad.Dialer {
 	switch route.Kind {
 	case "tcp":
-		return BoundTcpDialer{DestAddr: route.TcpAddr}
+		return BoundTcpDialer{DestAddr: route.TcpAddr, DialContext: stackDialer}
 
 	case "sosistab3":
-		inner := routeToDialer(route.Lower)
+		inner := routeToDialer(route.Lower, stackDialer)
 		return sosistab3Dialer{inner: inner, cookie: sosistab3.NewCookie(route.Cookie)}
 
 	case "race":
@@ -244,7 +250,7 @@ func routeToDialer(route *brokerproto.RouteDescriptor) sillad.Dialer {
 		}
 		inner := make([]sillad.Dialer, len(route.Routes))
 		for i := range route.Routes {
-			inner[i] = routeToDialer(&route.Routes[i])
+			inner[i] = routeToDialer(&route.Routes[i], stackDialer)
 		}
 		return sillad.RaceDialer{Inner: inner}
 
@@ -254,28 +260,28 @@ func routeToDialer(route *brokerproto.RouteDescriptor) sillad.Dialer {
 		}
 		inner := make([]sillad.Dialer, len(route.Routes))
 		for i := range route.Routes {
-			inner[i] = routeToDialer(&route.Routes[i])
+			inner[i] = routeToDialer(&route.Routes[i], stackDialer)
 		}
 		return sillad.FallbackDialer{Inner: inner}
 
 	case "timeout":
-		inner := routeToDialer(route.Lower)
+		inner := routeToDialer(route.Lower, stackDialer)
 		return sillad.TimeoutDialer{Inner: inner, Timeout: time.Duration(route.Milliseconds) * time.Millisecond}
 
 	case "delay":
-		inner := routeToDialer(route.Lower)
+		inner := routeToDialer(route.Lower, stackDialer)
 		return sillad.DelayDialer{Inner: inner, Delay: time.Duration(route.Milliseconds) * time.Millisecond}
 
 	case "conntest":
-		inner := routeToDialer(route.Lower)
+		inner := routeToDialer(route.Lower, stackDialer)
 		return conntest.Dialer{Inner: inner, PingCount: int(route.PingCount)}
 
 	case "hex":
-		inner := routeToDialer(route.Lower)
+		inner := routeToDialer(route.Lower, stackDialer)
 		return hexdialer.Dialer{Inner: inner}
 
 	case "plain_tls":
-		inner := routeToDialer(route.Lower)
+		inner := routeToDialer(route.Lower, stackDialer)
 		sni := "example.com"
 		if route.SNIDomain != nil && *route.SNIDomain != "" {
 			sni = *route.SNIDomain
@@ -283,7 +289,7 @@ func routeToDialer(route *brokerproto.RouteDescriptor) sillad.Dialer {
 		return plainTLSDialer{inner: inner, sni: sni}
 
 	case "meeklike":
-		inner := routeToDialer(route.Lower)
+		inner := routeToDialer(route.Lower, stackDialer)
 		key := blake3.Hash([]byte(route.MeeklikeKey))
 		cfg := meeklike.Config{
 			MaxInflight: route.MeeklikeCfg.MaxInflight,

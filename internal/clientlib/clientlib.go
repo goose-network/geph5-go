@@ -13,6 +13,12 @@
 // binds synchronously (Start returns an error if it cannot), while session
 // establishment (broker fetch, exit handshake) proceeds in the background; a
 // connection arriving before any session is up simply fails.
+//
+// Embedders that keep the client inside their own process boundary (the goose
+// plugin) set NoListener and dial in process via Client.OpenConn, and pass
+// StackDialer so the client's own TCP — broker RPCs and the route tree to the
+// exit — goes through the embedder's network stack rather than the raw system
+// dialer.
 package clientlib
 
 import (
@@ -36,8 +42,21 @@ import (
 type Options struct {
 	// Socks5Listen is the address the embedded SOCKS5 listener binds. Empty
 	// means "127.0.0.1:0" (an ephemeral loopback port); the actual bound
-	// address is reported by Client.SocksAddr.
+	// address is reported by Client.SocksAddr. Ignored when NoListener is
+	// set.
 	Socks5Listen string
+
+	// NoListener skips the embedded SOCKS5 listener entirely: Start binds no
+	// port, and embedders dial in process through Client.OpenConn. This is how
+	// the goose plugin consumes the client — no loopback hop between the
+	// engine and the embedded client.
+	NoListener bool
+
+	// StackDialer, when non-nil, establishes every raw TCP connection the
+	// client itself makes (to the broker, and through the route tree to the
+	// exit) instead of the system dialer — the embedding process's network
+	// stack. Nil is the system dialer, exactly as before.
+	StackDialer func(ctx context.Context, network, address string) (net.Conn, error)
 
 	// Config is the client configuration (exit constraint, credentials,
 	// broker, ...). Required: a config with no exit constraint cannot start.
@@ -45,14 +64,15 @@ type Options struct {
 }
 
 // Client is a running geph5 client bundle: database, broker client, auth
-// manager, session manager, and the SOCKS5 listener they feed. Use Close to
-// stop everything.
+// manager, session manager, and (unless NoListener) the SOCKS5 listener they
+// feed. Use Close to stop everything.
 type Client struct {
 	cancel  context.CancelFunc
 	stopped chan struct{} // closed when all goroutines have exited
 
 	sessMgr   *session.Manager
-	socksAddr string // the address the SOCKS5 listener actually bound
+	openConn  func(ctx context.Context, remote string) (net.Conn, error)
+	socksAddr string // the address the SOCKS5 listener actually bound ("" with NoListener)
 }
 
 // Start loads nothing and guesses nothing: cfg must already carry the exit
@@ -88,48 +108,58 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 	// Broker client. A missing/unbuildable broker is non-fatal — it only
 	// disables broker-dependent features (auth fetch, route-broker cache,
 	// non-direct exit constraints), exactly like cmd/geph-client/main.go.
-	broker, err := BuildBrokerClient(cfg)
+	broker, err := BuildBrokerClient(cfg, opts.StackDialer)
 	if err != nil {
 		log.Printf("clientlib: could not build broker client: %v (broker-dependent features disabled)", err)
 		broker = nil
 	}
 
 	authMgr := auth.NewManager(cfg, db, broker)
-	sessMgr := session.NewManager(cfg, authMgr, broker, db)
-
-	// Bind the SOCKS5 listener up front so Start fails fast on bind errors,
-	// and so we can hand back the real bound address for "127.0.0.1:0".
-	listen := opts.Socks5Listen
-	if listen == "" {
-		listen = "127.0.0.1:0"
-	}
-	ln, err := net.Listen("tcp", listen)
-	if err != nil {
-		return nil, fmt.Errorf("clientlib: socks5 listen %s: %w", listen, err)
-	}
+	sessMgr := session.NewManager(cfg, authMgr, broker, db, opts.StackDialer)
 
 	ctx, cancel := context.WithCancel(ctx)
 	c := &Client{
-		cancel:    cancel,
-		stopped:   make(chan struct{}),
-		sessMgr:   sessMgr,
-		socksAddr: ln.Addr().String(),
+		cancel:  cancel,
+		stopped: make(chan struct{}),
+		sessMgr: sessMgr,
 	}
 
 	openConn := sessMgr.AsOpenConnFunc()
+	c.openConn = openConn
+
+	// With NoListener, nothing binds: the embedder dials in process through
+	// Client.OpenConn. Otherwise bind the SOCKS5 listener up front so Start
+	// fails fast on bind errors, and so we can hand back the real bound
+	// address for "127.0.0.1:0".
+	var ln net.Listener
+	if !opts.NoListener {
+		listen := opts.Socks5Listen
+		if listen == "" {
+			listen = "127.0.0.1:0"
+		}
+		ln, err = net.Listen("tcp", listen)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("clientlib: socks5 listen %s: %w", listen, err)
+		}
+		c.socksAddr = ln.Addr().String()
+	}
 
 	go func() {
 		defer close(c.stopped)
 		var serveWG sync.WaitGroup
 
-		// SOCKS5 accept loop (owns ln; stops when ctx is canceled).
-		serveWG.Add(1)
-		go func() {
-			defer serveWG.Done()
-			if err := socks5.ServeOn(ctx, ln, openConn); err != nil && ctx.Err() == nil {
-				log.Printf("clientlib: socks5 serve stopped: %v", err)
-			}
-		}()
+		// SOCKS5 accept loop (owns ln; stops when ctx is canceled). Skipped
+		// entirely with NoListener.
+		if ln != nil {
+			serveWG.Add(1)
+			go func() {
+				defer serveWG.Done()
+				if err := socks5.ServeOn(ctx, ln, openConn); err != nil && ctx.Err() == nil {
+					log.Printf("clientlib: socks5 serve stopped: %v", err)
+				}
+			}()
+		}
 
 		// Auth loop (waits on broker; degrades when nil).
 		serveWG.Add(1)
@@ -160,8 +190,20 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 }
 
 // SocksAddr returns the address the embedded SOCKS5 listener bound (as passed
-// in Options, or the ephemeral port actually picked for "127.0.0.1:0").
+// in Options, or the ephemeral port actually picked for "127.0.0.1:0"). It is
+// empty when the client was started with NoListener, since nothing binds.
 func (c *Client) SocksAddr() string { return c.socksAddr }
+
+// OpenConn dials remote through the live session manager, in process: it is
+// the same function the SOCKS5 listener hands CONNECTs to, exposed directly so
+// embedders (the goose plugin) skip the loopback hop. It fails until at least
+// one session is live, just like a CONNECT would.
+func (c *Client) OpenConn(ctx context.Context, remote string) (net.Conn, error) {
+	if c.openConn == nil {
+		return nil, fmt.Errorf("clientlib: no open-conn path")
+	}
+	return c.openConn(ctx, remote)
+}
 
 // SessionCount returns the current number of live exit sessions the session
 // manager maintains. It is the readiness signal embedders poll: the SOCKS5
@@ -178,12 +220,14 @@ func (c *Client) Close() {
 // BuildBrokerClient constructs a brokerproto.BrokerClient from the configured
 // BrokerSource. Only the "direct" and "fronted" variants are wired here; other
 // variants (direct_tcp, aws_lambda, race, priority_race) return an error,
-// mirroring cmd/geph-client's buildBrokerClient helper.
-func BuildBrokerClient(cfg *config.Config) (*brokerproto.BrokerClient, error) {
+// mirroring cmd/geph-client's buildBrokerClient helper. stackDialer, when
+// non-nil, establishes the raw TCP connection to the broker (or its front);
+// nil is the system dialer.
+func BuildBrokerClient(cfg *config.Config, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) (*brokerproto.BrokerClient, error) {
 	if cfg == nil || cfg.Broker == nil {
 		return nil, fmt.Errorf("no broker source configured")
 	}
-	transport, err := brokerTransportFromSource(cfg.Broker)
+	transport, err := brokerTransportFromSource(cfg.Broker, stackDialer)
 	if err != nil {
 		return nil, err
 	}
@@ -193,11 +237,11 @@ func BuildBrokerClient(cfg *config.Config) (*brokerproto.BrokerClient, error) {
 // brokerTransportFromSource builds a nanorpc.RpcTransport for a BrokerSource.
 // Only the "direct" and "fronted" variants are wired (mirroring
 // cmd/geph-client/main.go); the rest are not yet implemented.
-func brokerTransportFromSource(src *config.BrokerSource) (nanorpc.RpcTransport, error) {
+func brokerTransportFromSource(src *config.BrokerSource, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) (nanorpc.RpcTransport, error) {
 	switch src.Kind {
 	case "direct":
 		// Direct broker URL, no domain fronting.
-		t, err := frontedhttp.New(src.Direct, "", nil)
+		t, err := frontedhttp.New(src.Direct, "", nil, stackDialer)
 		if err != nil {
 			return nil, err
 		}
@@ -206,7 +250,7 @@ func brokerTransportFromSource(src *config.BrokerSource) (nanorpc.RpcTransport, 
 		if src.Fronted == nil {
 			return nil, fmt.Errorf("fronted broker source missing payload")
 		}
-		t, err := frontedhttp.New(src.Fronted.Front, src.Fronted.Host, src.Fronted.OverrideDNS)
+		t, err := frontedhttp.New(src.Fronted.Front, src.Fronted.Host, src.Fronted.OverrideDNS, stackDialer)
 		if err != nil {
 			return nil, err
 		}

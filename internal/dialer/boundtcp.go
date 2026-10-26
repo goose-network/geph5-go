@@ -29,14 +29,26 @@ import (
 // performs a plain net.Dial, as specified).
 type BoundTcpDialer struct {
 	DestAddr string // "host:port" or "ip:port"
+
+	// DialContext, when non-nil, establishes the raw TCP connection instead
+	// of the system dialer. Embedders use it to route the client's own
+	// connections (client → exit) through their network stack (a userspace
+	// IP stack, a VPN, …). Nil is the system dialer, exactly as before.
+	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // Dial connects to d.DestAddr over TCP and returns a sillad.Pipe wrapping the
 // connection. The pipe's Protocol is "tcp" and RemoteAddrStr is the dialed
 // address. TCP_NODELAY is enabled, matching the Rust set_nodelay(true).
 func (d BoundTcpDialer) Dial(ctx context.Context) (sillad.Pipe, error) {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", d.DestAddr)
+	var conn net.Conn
+	var err error
+	if d.DialContext != nil {
+		conn, err = d.DialContext(ctx, "tcp", d.DestAddr)
+	} else {
+		var dialer net.Dialer
+		conn, err = dialer.DialContext(ctx, "tcp", d.DestAddr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("dialer: tcp connect %s: %w", d.DestAddr, err)
 	}
