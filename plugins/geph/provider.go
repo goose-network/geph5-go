@@ -90,6 +90,7 @@ import (
 	"log"
 	"maps"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -135,6 +136,27 @@ type clientConn interface {
 	Close()
 }
 
+// exitInfo is one broker-known exit, in the form the provider emits and the
+// web UI shows. The hostname is the constraint a per-exit dial pins.
+type exitInfo struct {
+	Hostname  string
+	PubkeyHex string
+	C2EListen string
+	Country   string
+	City      string
+}
+
+// exitIdleClose bounds how long a lazily-started per-exit client with no
+// traffic is kept before it is torn down again (a full session stack costs
+// 6 tunnels and an auth loop; pinning 20 exits should not hold 20 stacks
+// forever).
+const exitIdleClose = 10 * time.Minute
+
+// exitWaitSession bounds how long a dial waits for a freshly started per-exit
+// client's first session before failing (the engine retries the dial; the
+// client keeps establishing in the background).
+const exitWaitSession = 2 * time.Minute
+
 // Provider is a goose outbound provider backed by an embedded geph5 client.
 // It implements pub.Provider.
 type Provider struct {
@@ -145,7 +167,16 @@ type Provider struct {
 	ready    bool          // a live session tunnel exists
 	startErr error         // terminal startup error, surfaced via Outbounds
 	client   clientConn    // the embedded client (dials in process; no listener)
-	exit     *exitlib.Exit // non-nil in standalone (embedded_exit) mode
+	exit     *exitlib.Exit  // non-nil in standalone (embedded_exit) mode
+	exits    []exitInfo    // broker-known exits (per-exit outbound source)
+	// exitClients holds one lazily-started embedded client per pinned exit
+	// hostname; reapExitClients drops clients whose last dial is older than
+	// exitIdleClose.
+	exitClients map[string]*exitClientState
+	// exitCancels collects the cancel funcs of per-exit clients so Close stops
+	// them with the provider (their Close call alone does not stop the auth
+	// loop's goroutines; the context cancel does).
+	exitCancels []context.CancelFunc
 
 	// watch signals the engine that the outbound set changed (ready flip).
 	watchCh chan struct{}
@@ -153,6 +184,25 @@ type Provider struct {
 	// stop cancels the client; stopped is closed when the run goroutine exits.
 	stop    context.CancelFunc
 	stopped chan struct{}
+
+	// pinnedDialer starts per-exit clients lazily; swapped for a fake in tests.
+	pinnedDialer func(ctx context.Context, hostname string) (clientConn, error)
+
+	// stackDialer is the engine's layer-3/4 dialer threaded into started
+	// clients; stored at factory time because per-exit clients are started
+	// later, from the dial path, where it is no longer reachable.
+	stackDialer func(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// exitClientState tracks one lazily-booted per-exit client: the client, a
+// cached start failure (retried after exitStartRetry), and the time of the
+// last dial through it.
+type exitClientState struct {
+	mu       sync.Mutex
+	client   clientConn
+	startErr error
+	startAt  time.Time
+	lastUse  time.Time
 }
 
 // providerConfig is the deserialized provider config.
@@ -241,10 +291,12 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	}
 
 	p := &Provider{
-		cfg:     pc,
-		watchCh: make(chan struct{}, 1),
-		stopped: make(chan struct{}),
+		cfg:         pc,
+		watchCh:     make(chan struct{}, 1),
+		stopped:     make(chan struct{}),
+		stackDialer: stackDialer,
 	}
+	p.pinnedDialer = p.startExitClient
 	ctx, cancel := context.WithCancel(context.Background())
 	p.stop = cancel
 	go func() {
@@ -267,6 +319,134 @@ func (p *Provider) dialConn(ctx context.Context, remote string) (net.Conn, error
 		return nil, fmt.Errorf("geph provider: no live session (client not running or still establishing)")
 	}
 	return client.OpenConn(ctx, remote)
+}
+
+// exitStartRetry bounds how long a failed per-exit client start is cached
+// before a later dial retries it (mirrors psiphon's pinned-controller retry).
+const exitStartRetry = 30 * time.Second
+
+// dialExit is dialConn with the client pinned to one broker-known exit
+// (hostname), the per-server dial form behind each per-exit outbound. The
+// pinned client is started lazily on first dial and shared by every dial to
+// that exit (a full session stack is too heavy to boot per connection): the
+// state lock serializes the start, a fresh client's first dial waits for its
+// first live session, and later dials ride the established one. A failed
+// start is retried after exitStartRetry; idle clients are reaped on the next
+// Outbounds poll.
+func (p *Provider) dialExit(ctx context.Context, hostname, remote string) (net.Conn, error) {
+	p.mu.Lock()
+	st, ok := p.exitClients[hostname]
+	if !ok {
+		st = &exitClientState{}
+		if p.exitClients == nil {
+			p.exitClients = map[string]*exitClientState{}
+		}
+		p.exitClients[hostname] = st
+	}
+	p.mu.Unlock()
+
+	st.mu.Lock()
+	if st.client == nil && (st.startErr == nil || time.Since(st.startAt) > exitStartRetry) {
+		// Start under the state lock so a concurrent dial to the same exit
+		// cannot race a second client into existence.
+		client, err := p.pinnedDialer(ctx, hostname)
+		st.startAt = time.Now()
+		if err != nil {
+			st.startErr = err
+			st.mu.Unlock()
+			return nil, fmt.Errorf("geph provider: start client for exit %s: %w", hostname, err)
+		}
+		st.startErr = nil
+		st.client = client
+		log.Printf("geph provider: per-exit client for %s started", hostname)
+	}
+	st.lastUse = time.Now()
+	client := st.client
+	startErr := st.startErr
+	st.mu.Unlock()
+
+	if client == nil {
+		// The cached failure is retried by a later dial (see the window
+		// above); this dial only reports it.
+		return nil, fmt.Errorf("geph provider: exit %s unavailable (recent start failed, retrying later): %w", hostname, startErr)
+	}
+
+	// Wait for the pinned client's first session before handing the dial
+	// over — an OpenConn with no session would fail anyway, but this bounds
+	// the wait and surfaces "still establishing" instead of a tunnel error.
+	wctx, cancel := context.WithTimeout(ctx, exitWaitSession)
+	defer cancel()
+	if err := p.awaitExitSession(wctx, client); err != nil {
+		return nil, fmt.Errorf("geph provider: exit %s: %w", hostname, err)
+	}
+	return client.OpenConn(ctx, remote)
+}
+
+// awaitExitSession polls until the client reports a live session or ctx ends.
+func (p *Provider) awaitExitSession(ctx context.Context, client clientConn) error {
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if client.SessionCount() > 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("no live session: %w", ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
+// startExitClient boots a full embedded geph5 client whose exit constraint is
+// pinned to hostname. It is the production pinnedDialer; tests swap it. The
+// client's context is canceled by Close, so pinned clients stop with the
+// provider.
+func (p *Provider) startExitClient(ctx context.Context, hostname string) (clientConn, error) {
+	clientCfg, err := buildClientConfig(p.cfg)
+	if err != nil {
+		return nil, err
+	}
+	clientCfg.ExitConstraint = brokerproto.ExitConstraint{Kind: "hostname", Hostname: hostname}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	p.mu.Lock()
+	p.exitCancels = append(p.exitCancels, cancel)
+	p.mu.Unlock()
+	client, err := clientlib.Start(cancelCtx, clientlib.Options{
+		NoListener:  true,
+		StackDialer: p.stackDialer,
+		Config:      clientCfg,
+	})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return client, nil
+}
+
+// reapExitClients stops and drops pinned clients that have gone exitIdleClose
+// without a dial. Called from Outbounds — every engine poll — so there is no
+// dedicated reaper goroutine; each reaped client's Close stops its session
+// manager, and its exitCancels entry fires with the provider.
+func (p *Provider) reapExitClients() {
+	p.mu.Lock()
+	var reaped []*exitClientState
+	for hostname, st := range p.exitClients {
+		st.mu.Lock()
+		client := st.client
+		idle := !st.lastUse.IsZero() && time.Since(st.lastUse) > exitIdleClose
+		st.mu.Unlock()
+		if !idle || client == nil {
+			continue
+		}
+		delete(p.exitClients, hostname)
+		reaped = append(reaped, st)
+	}
+	p.mu.Unlock()
+	for _, st := range reaped {
+		st.client.Close()
+		log.Printf("geph provider: reaped idle per-exit client")
+	}
 }
 
 // parseConfig marshals the plugin config map into providerConfig. The
@@ -481,7 +661,95 @@ func (p *Provider) run(ctx context.Context, stackDialer func(ctx context.Context
 	// client is up, mirroring how tor's provider advertises as long as its
 	// guard link is alive. SetLiveness ping failures inside a session cause
 	// the session worker to rebuild tunnels automatically.
-	<-ctx.Done()
+	//
+	// Alongside the ready loop, poll the broker's net status for the exit
+	// roster (the per-exit outbound source) and reap idle per-exit clients —
+	// both re-signal Watch so the engine repolls Outbounds.
+	p.refreshLoop(ctx, client)
+}
+
+// exitListInterval is how often the provider re-fetches the broker's exit
+// roster. Slow on purpose: the roster changes rarely and each poll is a
+// broker RPC through possibly-censored wires.
+const exitListInterval = 10 * time.Minute
+
+// refreshLoop blocks until ctx is canceled, periodically refreshing the
+// broker-known exit roster and reaping idle per-exit clients. The FIRST
+// refresh happens immediately after the first live session so the exit list
+// fills the web UI without waiting a full interval.
+func (p *Provider) refreshLoop(ctx context.Context, client *clientlib.Client) {
+	p.refreshExitsOnce(ctx, client)
+	t := time.NewTicker(exitListInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.reapExitClients()
+			p.refreshExitsOnce(ctx, client)
+		}
+	}
+}
+
+// refreshExitsOnce fetches the broker's net status and stores the exit
+// roster on the provider, signaling Watch when the roster changed. It fails
+// soft: a broker hiccup keeps the previous list (an empty roster simply
+// means no per-exit outbounds, the general outbound still works).
+func (p *Provider) refreshExitsOnce(ctx context.Context, client *clientlib.Client) {
+	if client == nil {
+		return
+	}
+	broker, err := client.BrokerClient()
+	if err != nil {
+		// No broker (e.g. standalone/direct mode): there is no roster to
+		// list. Only the general outbound is emitted, which is the
+		// pre-existing behavior — connection pinned, nothing to do.
+		return
+	}
+	signed, err := broker.GetNetStatus(ctx)
+	if err != nil || signed == nil {
+		log.Printf("geph provider: net status fetch failed: %v", err)
+		return
+	}
+	var status brokerproto.NetStatus
+	// Early exits (direct constraint) may serve net_status unsigned.
+	if err := json.Unmarshal([]byte(signed.InnerLiteral), &status); err != nil {
+		log.Printf("geph provider: parse net status: %v", err)
+		return
+	}
+	exits := make([]exitInfo, 0, len(status.Exits))
+	for hostname, entry := range status.Exits {
+		exits = append(exits, exitInfo{
+			Hostname:  hostname,
+			PubkeyHex: entry.PubkeyHex(),
+			C2EListen: entry.Exit.C2EListen,
+			Country:   entry.Exit.Country,
+			City:      entry.Exit.City,
+		})
+	}
+	sort.Slice(exits, func(i, j int) bool { return exits[i].Hostname < exits[j].Hostname })
+	p.mu.Lock()
+	changed := !exitsEqual(p.exits, exits)
+	p.exits = exits
+	p.mu.Unlock()
+	if changed {
+		p.signalWatch()
+	}
+}
+
+// exitsEqual reports whether two rosters list the same exits (identity =
+// hostname; descriptors may refresh underneath).
+func exitsEqual(a, b []exitInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Hostname != b[i].Hostname {
+			return false
+		}
+	}
+	return true
 }
 
 // awaitSession polls the session manager until at least one session is live
@@ -527,22 +795,36 @@ func (p *Provider) Name() string { return "geph" }
 func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 
 // Outbounds returns the current outbound set: empty until the geph5 client
-// has a live session, then a single "geph" outbound, which dials through this
-// provider in process. A terminal startup failure returns the error so the
-// engine logs it (the existing pool, if any, is kept).
+// has a live session, then the general "geph" outbound PLUS one outbound per
+// broker-known exit — the geph analogue of the psiphon/tor per-server lists,
+// sourced from the broker's net status — so the engine's web UI can show and
+// pin the real exit roster. Per-exit outbounds are named <id>-<hostname>
+// and pin the dial's client to that exit's hostname constraint via the
+// "exit_hostname" config key. A terminal startup failure returns the error
+// so the engine logs it (the existing pool, if any, is kept).
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
+	// Rendezvous point for the idle reaper: every engine poll (~2 min) walks
+	// the pinned clients and stops the ones no dial touched for
+	// exitIdleClose.
+	p.reapExitClients()
+
 	p.mu.Lock()
 	ready := p.ready
 	err := p.startErr
 	id := p.cfg.OutboundID
+	exits := append([]exitInfo(nil), p.exits...)
 	p.mu.Unlock()
+	// Deterministic order regardless of how the roster was stored: the web
+	// Outbounds list and pool diffs stay stable across polls.
+	sort.Slice(exits, func(i, j int) bool { return exits[i].Hostname < exits[j].Hostname })
 	if err != nil {
 		return nil, err
 	}
 	if !ready {
 		return nil, nil
 	}
-	return []pub.OutboundConfig{
+
+	out := []pub.OutboundConfig{
 		{
 			ID:       id,
 			Protocol: "geph",
@@ -551,12 +833,28 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 				"tunnel": id,
 			},
 		},
-	}, nil
+	}
+	for _, e := range exits {
+		exitID := id + "-" + e.Hostname
+		out = append(out, pub.OutboundConfig{
+			ID:       exitID,
+			Protocol: "geph",
+			Config: map[string]any{
+				"id":            exitID,
+				"tunnel":        id,
+				"exit_hostname": e.Hostname,
+				"address":       e.C2EListen,
+				"country":       e.Country,
+				"city":          e.City,
+			},
+		})
+	}
+	return out, nil
 }
 
-// Close stops the embedded exit (standalone mode), the embedded geph5 client,
-// and the run goroutine, then drops the live-provider registration so dials
-// for this id fail fast instead of finding a dead provider.
+// Close stops the embedded exit (standalone mode), the embedded geph5 client
+// and every per-exit client, then drops the live-provider registration so
+// dials for this id fail fast instead of finding a dead provider.
 func (p *Provider) Close() error {
 	unregisterLiveProvider(p)
 	if p.stop != nil {
@@ -569,11 +867,27 @@ func (p *Provider) Close() error {
 		p.exit.Close()
 		p.exit = nil
 	}
+	exitStates := p.exitClients
+	p.exitClients = nil
+	cancels := p.exitCancels
+	p.exitCancels = nil
 	if p.client != nil {
 		p.client.Close()
 		p.client = nil
 	}
 	p.mu.Unlock()
+	for _, st := range exitStates {
+		st.mu.Lock()
+		client := st.client
+		st.client = nil
+		st.mu.Unlock()
+		if client != nil {
+			client.Close()
+		}
+	}
+	for _, cancel := range cancels {
+		cancel()
+	}
 	return nil
 }
 

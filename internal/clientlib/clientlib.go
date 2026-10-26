@@ -73,6 +73,7 @@ type Client struct {
 	sessMgr   *session.Manager
 	openConn  func(ctx context.Context, remote string) (net.Conn, error)
 	socksAddr string // the address the SOCKS5 listener actually bound ("" with NoListener)
+	broker    *brokerproto.BrokerClient // nil when no broker source is configured
 }
 
 // Start loads nothing and guesses nothing: cfg must already carry the exit
@@ -122,6 +123,7 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 		cancel:  cancel,
 		stopped: make(chan struct{}),
 		sessMgr: sessMgr,
+		broker:  broker,
 	}
 
 	openConn := sessMgr.AsOpenConnFunc()
@@ -209,6 +211,17 @@ func (c *Client) OpenConn(ctx context.Context, remote string) (net.Conn, error) 
 // manager maintains. It is the readiness signal embedders poll: the SOCKS5
 // listener is bound from Start on, but CONNECTs succeed only once this is > 0.
 func (c *Client) SessionCount() int { return len(c.sessMgr.LiveSessionInfos()) }
+
+// BrokerClient returns the broker client this client was started with, so
+// embedders can make their own broker RPCs (e.g. the exit roster via
+// get_net_status) instead of re-building a transport. It errors when no
+// broker is configured (standalone/direct setups).
+func (c *Client) BrokerClient() (*brokerproto.BrokerClient, error) {
+	if c.broker == nil {
+		return nil, fmt.Errorf("clientlib: no broker configured")
+	}
+	return c.broker, nil
+}
 
 // Close cancels the client's context and waits for the SOCKS5 listener, auth
 // loop, and session manager goroutines to exit.
