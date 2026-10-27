@@ -822,3 +822,144 @@ func TestStatusRunsConcurrently(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// dialRecorder is a thread-safe record of dialed "network address" pairs,
+// shared by the fake dialers below.
+type dialRecorder struct {
+	mu  sync.Mutex
+	rec []string
+}
+
+func (r *dialRecorder) record(network, address string) {
+	r.mu.Lock()
+	r.rec = append(r.rec, network+" "+address)
+	r.mu.Unlock()
+}
+
+func (r *dialRecorder) recorded() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.rec...)
+}
+
+// fakeUpstreamDialer is an UpstreamDialer stand-in for the injection tests:
+// it records dials and answers with a dead pipe (the client speaks real
+// protocols on top; the tests only assert the dial path).
+type fakeUpstreamDialer struct{ rec *dialRecorder }
+
+func (f fakeUpstreamDialer) DialUpstream(ctx context.Context, network, address string) (net.Conn, error) {
+	f.rec.record(network, address)
+	return deadPipe(ctx)
+}
+
+// fakeStackDialer is a StackDialer stand-in with the same recording shape.
+type fakeStackDialer struct{ rec *dialRecorder }
+
+func (f fakeStackDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	f.rec.record(network, address)
+	return deadPipe(ctx)
+}
+
+// deadPipe returns one end of a net.Pipe whose pair is closed when ctx ends,
+// so the returned "connections" never outlive the caller's context.
+func deadPipe(ctx context.Context) (net.Conn, error) {
+	a, b := net.Pipe()
+	go func() {
+		<-ctx.Done()
+		a.Close()
+		b.Close()
+	}()
+	return a, nil
+}
+
+// TestEngineDialerPrecedence verifies the dialer resolution: an injected
+// upstream route (the spec's upstream_proxy naming a goose route) outranks
+// the engine stack dialer, the stack takes the slot only without a route,
+// and a bare config yields the system dialer.
+func TestEngineDialerPrecedence(t *testing.T) {
+	d, viaRoute := engineDialer(map[string]any{})
+	if d != nil || viaRoute {
+		t.Fatalf("bare config: dialer=%T viaRoute=%v, want nil,false", d, viaRoute)
+	}
+
+	routeRec, stackRec := &dialRecorder{}, &dialRecorder{}
+	d, viaRoute = engineDialer(map[string]any{
+		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
+		pub.StackDialerKey:    fakeStackDialer{stackRec},
+	})
+	if !viaRoute {
+		t.Fatal("route+stack: viaRoute=false, want true")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := d(ctx, "tcp", "broker.example:7000"); err != nil {
+		t.Fatalf("route dial: %v", err)
+	}
+	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp broker.example:7000" {
+		t.Fatalf("route dials = %v, want exactly the one dial", got)
+	}
+	if got := stackRec.recorded(); len(got) != 0 {
+		t.Fatalf("engine stack dialed although a route was injected: %v", got)
+	}
+
+	stackOnly := &dialRecorder{}
+	d, viaRoute = engineDialer(map[string]any{
+		pub.StackDialerKey: fakeStackDialer{stackOnly},
+	})
+	if d == nil || viaRoute {
+		t.Fatalf("stack-only: dialer set=%t viaRoute=%v, want dialer,false", d != nil, viaRoute)
+	}
+	if _, err := d(ctx, "tcp", "broker.example:7000"); err != nil {
+		t.Fatalf("stack dial: %v", err)
+	}
+	if got := stackOnly.recorded(); len(got) != 1 {
+		t.Fatalf("stack dials = %v, want exactly the one dial", got)
+	}
+}
+
+// TestNewProviderRouteCarriesClientDials verifies the factory behavior: with
+// an injected engine route the client's own dials (the pinned exit's route
+// tree) ride the route — observable on the fake's recorder — and Status
+// reports engine_route, not engine_stack.
+func TestNewProviderRouteCarriesClientDials(t *testing.T) {
+	routeRec, stackRec := &dialRecorder{}, &dialRecorder{}
+	p, err := NewProvider(map[string]any{
+		"outbound_id":         "geph-route",
+		"exit_constraint":     map[string]any{"direct": "127.0.0.1:1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, // nothing answers; the client retries
+		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
+		pub.StackDialerKey:    fakeStackDialer{stackRec},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	prov := p.(*Provider)
+	defer prov.Close()
+
+	if !prov.viaRoute {
+		t.Fatal("provider does not record the injected route")
+	}
+	if prov.engineDialer == nil {
+		t.Fatal("provider has no engine dialer threaded")
+	}
+
+	// The session manager dials the pinned exit through the route and keeps
+	// retrying (nothing answers on the dead pipe); poll for the first dial.
+	deadline := time.Now().Add(10 * time.Second)
+	for len(routeRec.recorded()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := routeRec.recorded(); len(got) == 0 {
+		t.Fatal("the client never dialed through the injected route")
+	}
+	if got := stackRec.recorded(); len(got) != 0 {
+		t.Fatalf("engine stack dialed although a route was injected: %v", got)
+	}
+
+	st := prov.Status()
+	if st.Details["engine_route"] != true {
+		t.Fatalf("Status engine_route = %v, want true", st.Details["engine_route"])
+	}
+	if st.Details["engine_stack"] != false {
+		t.Fatalf("Status engine_stack = %v, want false under a route", st.Details["engine_stack"])
+	}
+}

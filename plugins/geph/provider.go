@@ -12,10 +12,14 @@
 //
 // The client's own TCP — broker RPCs (including domain-fronted ones) and the
 // compiled route tree to the exit (sosistab3, plain TLS, meeklike, TCP
-// hops) — dials through the engine's layer-3/4 stack: the engine injects its
-// stack dialer under goose-plugin-api's StackDialerKey, and the plugin hands
-// it to clientlib as Options.StackDialer, which threads it down to every
-// BoundTcpDialer and the broker transport.
+// hops) — dials through the engine: when the provider spec's upstream_proxy
+// names a goose route (outbound:/pool:/chain:), the engine injects its route
+// dialer (goose-plugin-api's UpstreamDialer), which carries every connection
+// so the whole client rides that outbound/pool/chain; otherwise the engine's
+// stack dialer (StackDialer — layer 2/3/4, system kernel or gvisor netstack)
+// takes the slot. The plugin hands whichever it has to clientlib as
+// Options.StackDialer, which threads it down to every BoundTcpDialer and the
+// broker transport.
 //
 // This package lives inside the geph5-go module (not a separate repo) because
 // it embeds geph5-go's internal packages (internal/clientlib → internal/auth,
@@ -198,10 +202,16 @@ type Provider struct {
 	// pinnedDialer starts per-exit clients lazily; swapped for a fake in tests.
 	pinnedDialer func(ctx context.Context, hostname string) (clientConn, error)
 
-	// stackDialer is the engine's layer-3/4 dialer threaded into started
-	// clients; stored at factory time because per-exit clients are started
-	// later, from the dial path, where it is no longer reachable.
-	stackDialer func(ctx context.Context, network, address string) (net.Conn, error)
+	// engineDialer is the dialer threaded into every started client — the
+	// injected upstream route's dialer when the spec's upstream_proxy names
+	// a goose route, else the engine's layer-3/4 stack dialer — stored at
+	// factory time because per-exit clients are started later, from the dial
+	// path, where it is no longer reachable.
+	engineDialer func(ctx context.Context, network, address string) (net.Conn, error)
+	// viaRoute records that engineDialer came from an injected engine route
+	// (the spec's upstream_proxy names an outbound:/pool:/chain:); surfaced
+	// through Status details as "engine_route".
+	viaRoute bool
 }
 
 // The provider reports live self-assessed state to the engine's status API.
@@ -287,6 +297,21 @@ func (o embeddedExitOptions) exitlibOptions() (exitlib.Options, error) {
 	return opts, nil
 }
 
+// engineDialer resolves the engine-injected dialer the client's own TCP
+// rides: the upstream route dialer when the provider spec's upstream_proxy
+// names a goose route (outbound:/pool:/chain: — the engine injects it under
+// pub.UpstreamDialerKey), else the engine's layer-3/4 stack dialer, else nil
+// (the system dialer, e.g. unit tests). viaRoute reports the route case.
+func engineDialer(cfg map[string]any) (dial func(ctx context.Context, network, address string) (net.Conn, error), viaRoute bool) {
+	if ud := pub.AsUpstreamDialer(cfg); ud != nil {
+		return ud.DialUpstream, true
+	}
+	if sd := pub.AsStackDialer(cfg); sd != nil {
+		return sd.Dial, false
+	}
+	return nil, false
+}
+
 // NewProvider is the ProviderFactory registered as "geph". It parses the
 // config and starts the geph5 client bootstrap in the background; Outbounds
 // returns a "geph" outbound once the client has a live session, and an empty
@@ -300,28 +325,27 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 		pc.OutboundID = "geph"
 	}
 
-	// Route the client's own TCP (broker, exit route tree) through the
-	// engine's layer-3/4 stack — the system kernel or gvisor netstack —
-	// rather than the raw system dialer. The engine injects its dialer under
-	// pub.StackDialerKey; when absent (e.g. unit tests) the client falls back
-	// to the system dialer.
-	var stackDialer func(ctx context.Context, network, address string) (net.Conn, error)
-	if sd := pub.AsStackDialer(cfg); sd != nil {
-		stackDialer = sd.Dial
-	}
+	// Route the client's own TCP (broker RPCs, exit route tree) through the
+	// engine — the injected upstream route when the spec's upstream_proxy
+	// names a goose outbound/pool/chain, else the engine's layer-3/4 stack
+	// (system kernel or gvisor netstack) — rather than the raw system dialer.
+	// When neither is injected (e.g. unit tests) the client falls back to the
+	// system dialer.
+	dialer, viaRoute := engineDialer(cfg)
 
 	p := &Provider{
-		cfg:         pc,
-		watchCh:     make(chan struct{}, 1),
-		stopped:     make(chan struct{}),
-		stackDialer: stackDialer,
+		cfg:          pc,
+		watchCh:      make(chan struct{}, 1),
+		stopped:      make(chan struct{}),
+		engineDialer: dialer,
+		viaRoute:     viaRoute,
 	}
 	p.pinnedDialer = p.startExitClient
 	ctx, cancel := context.WithCancel(context.Background())
 	p.stop = cancel
 	go func() {
 		defer close(p.stopped)
-		p.run(ctx, stackDialer)
+		p.run(ctx, dialer)
 	}()
 	registerLiveProvider(p)
 	return p, nil
@@ -434,7 +458,7 @@ func (p *Provider) startExitClient(ctx context.Context, hostname string) (client
 	p.mu.Unlock()
 	client, err := clientlib.Start(cancelCtx, clientlib.Options{
 		NoListener:  true,
-		StackDialer: p.stackDialer,
+		StackDialer: p.engineDialer,
 		Config:      clientCfg,
 	})
 	if err != nil {
@@ -611,7 +635,7 @@ func quoteJSONString(s string) string {
 // is canceled; clientlib owns the client's internal retry semantics, so
 // unlike the tor provider there is no backoff loop here — the session manager
 // already retries tunnel establishment forever.
-func (p *Provider) run(ctx context.Context, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) {
+func (p *Provider) run(ctx context.Context, dialer func(ctx context.Context, network, address string) (net.Conn, error)) {
 	p.setPhase("starting")
 	clientCfg, err := buildClientConfig(p.cfg)
 	if err != nil {
@@ -651,11 +675,11 @@ func (p *Provider) run(ctx context.Context, stackDialer func(ctx context.Context
 	}
 
 	// NoListener: nothing binds — the "geph" outbound dials the session
-	// manager in process via Client.OpenConn. stackDialer carries the
-	// engine's network stack into the client's own connections.
+	// manager in process via Client.OpenConn. dialer carries the engine
+	// (injected route, else layer-3/4 stack) into the client's connections.
 	client, err := clientlib.Start(ctx, clientlib.Options{
 		NoListener:  true,
-		StackDialer: stackDialer,
+		StackDialer: dialer,
 		Config:      clientCfg,
 	})
 	if err != nil {
@@ -903,6 +927,7 @@ func (p *Provider) Status() pub.ProviderStatus {
 	refreshAt := p.refreshAt
 	refreshErr := p.refreshErr
 	exits := len(p.exits)
+	dialer, viaRoute := p.engineDialer, p.viaRoute
 	exitAddr, exitPubkey := "", ""
 	if p.exit != nil {
 		exitAddr = p.exit.C2EAddr()
@@ -923,6 +948,11 @@ func (p *Provider) Status() pub.ProviderStatus {
 	details := map[string]any{
 		"mode":            "broker",
 		"exits_in_roster": exits,
+		// Transport of the client's own dials: an injected engine route
+		// (spec upstream_proxy naming outbound:/pool:/chain:) or the engine
+		// layer-3/4 stack.
+		"engine_route": viaRoute,
+		"engine_stack": dialer != nil && !viaRoute,
 	}
 	if exitAddr != "" {
 		details["mode"] = "embedded_exit"

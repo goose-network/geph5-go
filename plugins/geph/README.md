@@ -19,12 +19,16 @@ goose inbound ──▶ pool ──▶ "geph" outbound ──▶ OpenConn (in pr
 ```
 
 The client's own TCP — broker RPCs (including domain-fronted ones) and the
-compiled route tree to the exit — dials through **goose's layer-3/4 stack**
-(the system kernel stack or the gvisor netstack): the engine injects its stack
-dialer into the provider config (`goose-plugin-api`'s `StackDialer`), and the
-plugin hands it to the client as `clientlib.Options.StackDialer`, which
-threads it down to every TCP dialer in the route tree and the broker
-transport.
+compiled route tree to the exit — dials through **the engine**: when the
+provider spec's `upstream_proxy` names a goose route (`outbound:`/`pool:`/
+`chain:`), the injected route dialer (`goose-plugin-api`'s `UpstreamDialer`)
+carries every client connection, so the whole client — broker, route tree,
+exit dials — rides that outbound/pool/chain (whose own outermost hop rides
+the engine stack). Without a route, the engine's stack dialer
+(`StackDialer` — layer 2/3/4, the system kernel stack or the gvisor
+netstack) takes the slot. The plugin hands whichever it has to the client as
+`clientlib.Options.StackDialer`, which threads it down to every TCP dialer
+in the route tree and the broker transport.
 
 With the `embedded_exit` option the last hop changes: a **Go** geph5 exit
 (`geph5-go`'s `internal/exitlib`) runs inside the provider's own process, so
