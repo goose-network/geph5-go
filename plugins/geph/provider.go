@@ -158,7 +158,7 @@ const exitIdleClose = 10 * time.Minute
 const exitWaitSession = 2 * time.Minute
 
 // Provider is a goose outbound provider backed by an embedded geph5 client.
-// It implements pub.Provider.
+// It implements pub.Provider and pub.StatusReporter.
 type Provider struct {
 	cfg providerConfig
 
@@ -167,7 +167,7 @@ type Provider struct {
 	ready    bool          // a live session tunnel exists
 	startErr error         // terminal startup error, surfaced via Outbounds
 	client   clientConn    // the embedded client (dials in process; no listener)
-	exit     *exitlib.Exit  // non-nil in standalone (embedded_exit) mode
+	exit     *exitlib.Exit // non-nil in standalone (embedded_exit) mode
 	exits    []exitInfo    // broker-known exits (per-exit outbound source)
 	// exitClients holds one lazily-started embedded client per pinned exit
 	// hostname; reapExitClients drops clients whose last dial is older than
@@ -177,6 +177,16 @@ type Provider struct {
 	// them with the provider (their Close call alone does not stop the auth
 	// loop's goroutines; the context cancel does).
 	exitCancels []context.CancelFunc
+
+	// observability snapshot for Status(), guarded by mu: the bootstrap
+	// phase, when the first session went live, and the broker-roster
+	// refresh bookkeeping (refreshErr is soft — a failed poll keeps the
+	// previous roster).
+	phase      string    // "starting", "connecting", "running"
+	readyAt    time.Time // when the first live session appeared
+	refreshAt  time.Time // last successful broker roster fetch
+	refreshErr error     // last roster fetch failure
+	closed     bool      // Close was called
 
 	// watch signals the engine that the outbound set changed (ready flip).
 	watchCh chan struct{}
@@ -192,6 +202,16 @@ type Provider struct {
 	// clients; stored at factory time because per-exit clients are started
 	// later, from the dial path, where it is no longer reachable.
 	stackDialer func(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// The provider reports live self-assessed state to the engine's status API.
+var _ pub.StatusReporter = (*Provider)(nil)
+
+// setPhase records the bootstrap phase shown by Status().
+func (p *Provider) setPhase(phase string) {
+	p.mu.Lock()
+	p.phase = phase
+	p.mu.Unlock()
 }
 
 // exitClientState tracks one lazily-booted per-exit client: the client, a
@@ -592,6 +612,7 @@ func quoteJSONString(s string) string {
 // unlike the tor provider there is no backoff loop here — the session manager
 // already retries tunnel establishment forever.
 func (p *Provider) run(ctx context.Context, stackDialer func(ctx context.Context, network, address string) (net.Conn, error)) {
+	p.setPhase("starting")
 	clientCfg, err := buildClientConfig(p.cfg)
 	if err != nil {
 		p.setTerminal(err)
@@ -643,6 +664,7 @@ func (p *Provider) run(ctx context.Context, stackDialer func(ctx context.Context
 	}
 	p.mu.Lock()
 	p.client = client
+	p.phase = "connecting"
 	p.mu.Unlock()
 
 	// Wait for a live session (the first tunnel through which traffic can
@@ -710,12 +732,18 @@ func (p *Provider) refreshExitsOnce(ctx context.Context, client *clientlib.Clien
 	signed, err := broker.GetNetStatus(ctx)
 	if err != nil || signed == nil {
 		log.Printf("geph provider: net status fetch failed: %v", err)
+		p.mu.Lock()
+		p.refreshErr = fmt.Errorf("net status fetch failed: %w", err)
+		p.mu.Unlock()
 		return
 	}
 	var status brokerproto.NetStatus
 	// Early exits (direct constraint) may serve net_status unsigned.
 	if err := json.Unmarshal([]byte(signed.InnerLiteral), &status); err != nil {
 		log.Printf("geph provider: parse net status: %v", err)
+		p.mu.Lock()
+		p.refreshErr = fmt.Errorf("parse net status: %w", err)
+		p.mu.Unlock()
 		return
 	}
 	exits := make([]exitInfo, 0, len(status.Exits))
@@ -732,6 +760,8 @@ func (p *Provider) refreshExitsOnce(ctx context.Context, client *clientlib.Clien
 	p.mu.Lock()
 	changed := !exitsEqual(p.exits, exits)
 	p.exits = exits
+	p.refreshAt = time.Now()
+	p.refreshErr = nil
 	p.mu.Unlock()
 	if changed {
 		p.signalWatch()
@@ -763,6 +793,8 @@ func (p *Provider) awaitSession(ctx context.Context, client clientConn) error {
 		if client.SessionCount() > 0 {
 			p.mu.Lock()
 			p.ready = true
+			p.phase = "running"
+			p.readyAt = time.Now()
 			p.mu.Unlock()
 			log.Printf("geph provider: geph5 client has a live session")
 			p.signalWatch()
@@ -852,6 +884,98 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	return out, nil
 }
 
+// Status implements pub.StatusReporter: a cheap in-memory snapshot of the
+// provider's own view — bootstrap phase, roster freshness, session counts —
+// merged into the engine's /api/providers/status "plugin" field. All values
+// are flat scalars or string slices for the UI; the provider's credential
+// config (secret, username, password) is deliberately never included.
+func (p *Provider) Status() pub.ProviderStatus {
+	// Snapshot under mu; the session counts are read after releasing it so a
+	// slow client never blocks other mu users (Close holds mu while stopping
+	// the embedded exit).
+	p.mu.Lock()
+	startErr := p.startErr
+	ready := p.ready
+	readyAt := p.readyAt
+	phase := p.phase
+	closed := p.closed
+	client := p.client
+	refreshAt := p.refreshAt
+	refreshErr := p.refreshErr
+	exits := len(p.exits)
+	exitAddr, exitPubkey := "", ""
+	if p.exit != nil {
+		exitAddr = p.exit.C2EAddr()
+		exitPubkey = p.exit.PubkeyHex()
+	}
+	pinnedStates := make([]struct {
+		hostname string
+		st       *exitClientState
+	}, 0, len(p.exitClients))
+	for host, st := range p.exitClients {
+		pinnedStates = append(pinnedStates, struct {
+			hostname string
+			st       *exitClientState
+		}{host, st})
+	}
+	p.mu.Unlock()
+
+	details := map[string]any{
+		"mode":            "broker",
+		"exits_in_roster": exits,
+	}
+	if exitAddr != "" {
+		details["mode"] = "embedded_exit"
+		details["embedded_exit_addr"] = exitAddr
+		details["embedded_exit_pubkey"] = exitPubkey
+	}
+	if !refreshAt.IsZero() {
+		details["last_roster_refresh"] = refreshAt.UTC().Format(time.RFC3339)
+	}
+	if refreshErr != nil {
+		details["roster_error"] = refreshErr.Error()
+	}
+	if client != nil {
+		details["open_sessions"] = client.SessionCount()
+	}
+	if len(pinnedStates) > 0 {
+		pinned := make([]string, 0, len(pinnedStates))
+		sessions := 0
+		for _, ps := range pinnedStates {
+			ps.st.mu.Lock()
+			c := ps.st.client
+			ps.st.mu.Unlock()
+			if c == nil {
+				continue // start failed or reaped; retried on the next dial
+			}
+			pinned = append(pinned, ps.hostname)
+			sessions += c.SessionCount()
+		}
+		sort.Strings(pinned)
+		details["pinned_exits"] = pinned
+		details["exit_client_sessions"] = sessions
+	}
+
+	switch {
+	case closed:
+		return pub.ProviderStatus{State: "stopped", Details: details}
+	case startErr != nil:
+		return pub.ProviderStatus{State: "error", Message: startErr.Error(), Details: details}
+	case ready:
+		if !readyAt.IsZero() {
+			details["ready_since"] = readyAt.UTC().Format(time.RFC3339)
+		}
+		return pub.ProviderStatus{State: "running", Details: details}
+	case client != nil:
+		return pub.ProviderStatus{State: "connecting", Message: "waiting for the first live session", Details: details}
+	default:
+		if phase == "" {
+			phase = "starting"
+		}
+		return pub.ProviderStatus{State: "starting", Message: phase + ": booting the embedded client", Details: details}
+	}
+}
+
 // Close stops the embedded exit (standalone mode), the embedded geph5 client
 // and every per-exit client, then drops the live-provider registration so
 // dials for this id fail fast instead of finding a dead provider.
@@ -863,6 +987,7 @@ func (p *Provider) Close() error {
 	<-p.stopped
 	p.mu.Lock()
 	p.ready = false
+	p.closed = true
 	if p.exit != nil {
 		p.exit.Close()
 		p.exit = nil

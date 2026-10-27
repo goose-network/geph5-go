@@ -1,7 +1,7 @@
 github.com/google/btree v1.1.2 h1:xf4v41cLI2Z6FxbKm+8Bu+m8ifhj15JuZ9sa0jZCMUU=
 github.com/google/btree v1.1.2/go.mod h1:qOPhT0dTNdNzV6Z/lhRX0YXUafgPLFUh+gZMl761Gm4=
-github.com/goose-network/goose-plugin-api v0.0.0-20261026123131-fb552d7d52b0 h1:8JM+933Fi5mocPxB8+PBBrISsUuQ8ipWdQ8R5ZHn9oY=
-github.com/goose-network/goose-plugin-api v0.0.0-20261026123131-fb552d7d52b0/go.mod h1:EYQF1WhEU/JhxP3SkSSjAWLBlnazvrj0Ex1EL4G3oHY=
+github.com/goose-network/goose-plugin-api v0.0.0-20261026144344-7d923b10a2d5 h1:CocrKEbeR63AX+Walg8olrNWfCpYlf3Jv14odXVDPLs=
+github.com/goose-network/goose-plugin-api v0.0.0-20261026144344-7d923b10a2d5/go.mod h1:EYQF1WhEU/JhxP3SkSSjAWLBlnazvrj0Ex1EL4G3oHY=
 github.com/klauspost/cpuid/v2 v2.0.12 h1:p9dKCg8i4gmOxtv35DvrYoWqYzQrvEVdjQ762Y0OqZE=
 github.com/klauspost/cpuid/v2 v2.0.12/go.mod h1:g2LTdtYhdyuGPqyWyv7qRAmj1WBqxuObKfj5c0PQa7c=
 github.com/zeebo/assert v1.1.0 h1:hU1L1vLTHsnO8x8c9KAR5GmM5QscxHg5RNU5z5qbUWY=

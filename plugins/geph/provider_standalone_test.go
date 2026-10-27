@@ -85,6 +85,31 @@ func TestGephProviderStandalone(t *testing.T) {
 	}
 	t.Logf("provider ready: outbound %s (%s)", ob.ID(), ob.Address())
 
+	// 3.5 The self-reported status must agree with reality: running, embedded
+	//     exit mode, its address and pubkey visible, at least the one live
+	//     session the dial rides.
+	st := p.(*Provider).Status()
+	if st.State != "running" {
+		t.Fatalf("Status().State = %q, want running (message %q)", st.State, st.Message)
+	}
+	if st.Details["mode"] != "embedded_exit" {
+		t.Fatalf("status mode = %v, want embedded_exit", st.Details["mode"])
+	}
+	if addr, _ := st.Details["embedded_exit_addr"].(string); addr == "" {
+		t.Fatal("status must report the embedded exit's c2e address")
+	}
+	if pk, _ := st.Details["embedded_exit_pubkey"].(string); len(pk) != 64 {
+		t.Fatalf("status embedded_exit_pubkey = %q, want 64 hex chars", pk)
+	}
+	if sess, _ := st.Details["open_sessions"].(int); sess < 1 {
+		t.Fatalf("status open_sessions = %v, want >= 1", st.Details["open_sessions"])
+	}
+	if _, ok := st.Details["ready_since"]; !ok {
+		t.Fatal("running status must report ready_since")
+	}
+	t.Logf("status: state=%s mode=%v addr=%v sessions=%v",
+		st.State, st.Details["mode"], st.Details["embedded_exit_addr"], st.Details["open_sessions"])
+
 	// 4. Real HTTP through the in-process dial path — no listener, no
 	//    loopback hop: outbound → client tunnels → the embedded exit → the
 	//    loopback target.

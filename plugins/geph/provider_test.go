@@ -1,12 +1,14 @@
 package geph
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -633,4 +635,190 @@ func TestRefreshExitsOnceNoBroker(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("exits = %d, want 0 without a broker", n)
 	}
+}
+
+// countClient is a clientConn with a fixed session count, for status tests
+// (fakeClient always reports 1; the status sums need variety).
+type countClient struct{ sessions int }
+
+func (c *countClient) OpenConn(ctx context.Context, remote string) (net.Conn, error) {
+	return nil, errors.New("not implemented")
+}
+func (c *countClient) SessionCount() int { return c.sessions }
+func (c *countClient) Close()            {}
+
+// statusFixture returns a Provider whose state is set by mutate (under the
+// provider lock), so Status() tests need no booted client stack. The config
+// carries credentials on purpose: the status payload must never leak them.
+func statusFixture(mutate func(p *Provider)) *Provider {
+	p := &Provider{
+		cfg: providerConfig{
+			OutboundID: "geph-status",
+			Secret:     "s3cret-value",
+			Username:   "user-value",
+			Password:   "pass-value",
+		},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+	}
+	p.mu.Lock()
+	mutate(p)
+	p.mu.Unlock()
+	return p
+}
+
+// TestStatusReporting walks the Status() state machine and its details.
+func TestStatusReporting(t *testing.T) {
+	// Starting: a fresh provider, no client yet.
+	st := statusFixture(func(p *Provider) {}).Status()
+	if st.State != "starting" {
+		t.Fatalf("starting: state=%q", st.State)
+	}
+	if st.Details["mode"] != "broker" {
+		t.Fatalf("mode=%v, want broker by default", st.Details["mode"])
+	}
+	if st.Details["exits_in_roster"] != 0 {
+		t.Fatalf("exits_in_roster=%v, want 0", st.Details["exits_in_roster"])
+	}
+
+	// Connecting: the client is up, no live session yet.
+	st = statusFixture(func(p *Provider) {
+		p.client = &countClient{sessions: 0}
+		p.phase = "connecting"
+	}).Status()
+	if st.State != "connecting" || st.Message != "waiting for the first live session" {
+		t.Fatalf("connecting: state=%q message=%q", st.State, st.Message)
+	}
+	if _, ok := st.Details["open_sessions"]; !ok {
+		t.Fatal("connecting status must report open_sessions (even 0)")
+	}
+
+	// Running with a broker roster: ready flip, refresh bookkeeping, sessions.
+	st = statusFixture(func(p *Provider) {
+		p.ready = true
+		p.phase = "running"
+		p.readyAt = time.Now().Add(-time.Minute)
+		p.client = &countClient{sessions: 2}
+		p.exits = []exitInfo{{Hostname: "a.example"}, {Hostname: "b.example"}, {Hostname: "c.example"}}
+		p.refreshAt = time.Now().Add(-5 * time.Minute)
+	}).Status()
+	if st.State != "running" || st.Message != "" {
+		t.Fatalf("running: state=%q message=%q", st.State, st.Message)
+	}
+	if st.Details["exits_in_roster"] != 3 {
+		t.Fatalf("exits_in_roster=%v, want 3", st.Details["exits_in_roster"])
+	}
+	if st.Details["open_sessions"] != 2 {
+		t.Fatalf("open_sessions=%v, want 2", st.Details["open_sessions"])
+	}
+	for _, k := range []string{"ready_since", "last_roster_refresh"} {
+		if _, ok := st.Details[k]; !ok {
+			t.Fatalf("running status must report %s", k)
+		}
+	}
+
+	// A roster failure is visible but never fatal.
+	st = statusFixture(func(p *Provider) {
+		p.ready = true
+		p.phase = "running"
+		p.readyAt = time.Now()
+		p.refreshErr = errors.New("broker unreachable")
+	}).Status()
+	if st.State != "running" {
+		t.Fatalf("roster_error must not flip the state: %q", st.State)
+	}
+	if st.Details["roster_error"] != "broker unreachable" {
+		t.Fatalf("roster_error=%v", st.Details["roster_error"])
+	}
+
+	// A terminal startup error wins over the phase.
+	st = statusFixture(func(p *Provider) {
+		p.startErr = errors.New("bad config")
+		p.client = &countClient{sessions: 1}
+	}).Status()
+	if st.State != "error" || st.Message != "bad config" {
+		t.Fatalf("error: state=%q message=%q", st.State, st.Message)
+	}
+
+	// Stopped wins over everything, terminal errors included.
+	st = statusFixture(func(p *Provider) {
+		p.closed = true
+		p.startErr = errors.New("bad config")
+	}).Status()
+	if st.State != "stopped" {
+		t.Fatalf("stopped: state=%q", st.State)
+	}
+
+	// Pinned per-exit clients: hostnames listed sorted, session counts summed;
+	// a state whose start failed contributes neither.
+	st = statusFixture(func(p *Provider) {
+		p.ready = true
+		p.phase = "running"
+		p.readyAt = time.Now()
+		p.exitClients = map[string]*exitClientState{
+			"zeta.example":   {client: &countClient{sessions: 1}},
+			"alpha.example":  {client: &countClient{sessions: 3}},
+			"failed.example": {},
+		}
+	}).Status()
+	pinned, ok := st.Details["pinned_exits"].([]string)
+	if !ok || len(pinned) != 2 || pinned[0] != "alpha.example" || pinned[1] != "zeta.example" {
+		t.Fatalf("pinned_exits=%v", st.Details["pinned_exits"])
+	}
+	if st.Details["exit_client_sessions"] != 4 {
+		t.Fatalf("exit_client_sessions=%v, want 4", st.Details["exit_client_sessions"])
+	}
+
+	// Credentials never leak into the status payload.
+	raw, err := json.Marshal(statusFixture(func(p *Provider) {
+		p.ready = true
+		p.phase = "running"
+		p.readyAt = time.Now()
+	}).Status())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"s3cret-value", "user-value", "pass-value"} {
+		if bytes.Contains(raw, []byte(secret)) {
+			t.Fatalf("status payload leaks credential %q: %s", secret, raw)
+		}
+	}
+}
+
+// TestStatusRunsConcurrently hammers Status against the mutating paths it
+// snapshots (phase flips, ready flips, roster updates, the Outbounds reaper)
+// for the race detector.
+func TestStatusRunsConcurrently(t *testing.T) {
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "geph-race"},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+	}
+	p.exitClients = map[string]*exitClientState{
+		"alpha.example": {client: &countClient{sessions: 1}},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = p.Status()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 100; j++ {
+			p.setPhase("connecting")
+			p.mu.Lock()
+			p.ready = j%2 == 0
+			p.exits = []exitInfo{{Hostname: "a.example"}}
+			p.exitClients["zeta.example"] = &exitClientState{client: &countClient{sessions: 1}}
+			p.mu.Unlock()
+			p.Outbounds(context.Background())
+		}
+	}()
+	wg.Wait()
 }
