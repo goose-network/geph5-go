@@ -11,11 +11,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/config"
-	"github.com/geph-official/geph5-go/internal/database"
-	"github.com/geph-official/geph5-go/internal/session"
-	"github.com/geph-official/geph5-go/internal/tunnelcmd"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/config"
+	"github.com/goose-network/geph5-go/internal/database"
+	"github.com/goose-network/geph5-go/internal/session"
+	"github.com/goose-network/geph5-go/internal/tunnelcmd"
 )
 
 func main() {

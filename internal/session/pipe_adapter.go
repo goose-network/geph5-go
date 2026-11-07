@@ -13,8 +13,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/picomux"
-	"github.com/geph-official/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/picomux"
+	"github.com/goose-network/geph5-go/internal/sillad"
 )
 
 // streamPipe adapts a picomux.Stream to sillad.Pipe.

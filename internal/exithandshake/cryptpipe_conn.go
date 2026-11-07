@@ -28,7 +28,7 @@ import (
 
 	"golang.org/x/crypto/chacha20poly1305"
 
-	"github.com/geph-official/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/sillad"
 )
 
 // maxCryptRecord is the 100KB cap from read_prepend_length / write_prepend_length.

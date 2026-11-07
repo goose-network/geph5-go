@@ -28,14 +28,14 @@ import (
 	"net"
 	"sync"
 
-	"github.com/geph-official/geph5-go/internal/auth"
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/config"
-	"github.com/geph-official/geph5-go/internal/database"
-	"github.com/geph-official/geph5-go/internal/frontedhttp"
-	"github.com/geph-official/geph5-go/internal/nanorpc"
-	"github.com/geph-official/geph5-go/internal/proxy/socks5"
-	"github.com/geph-official/geph5-go/internal/session"
+	"github.com/goose-network/geph5-go/internal/auth"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/config"
+	"github.com/goose-network/geph5-go/internal/database"
+	"github.com/goose-network/geph5-go/internal/frontedhttp"
+	"github.com/goose-network/geph5-go/internal/nanorpc"
+	"github.com/goose-network/geph5-go/internal/proxy/socks5"
+	"github.com/goose-network/geph5-go/internal/session"
 )
 
 // Options configures a client bundle.

@@ -26,7 +26,7 @@ import (
 	"net"
 	"sync"
 
-	"github.com/geph-official/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/sillad"
 )
 
 // RpcService dispatches a single decoded JrpcRequest to produce a

@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/blake3"
-	"github.com/geph-official/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/blake3"
+	"github.com/goose-network/geph5-go/internal/sillad"
 )
 
 // Config mirrors sillad_meeklike::MeeklikeConfig.

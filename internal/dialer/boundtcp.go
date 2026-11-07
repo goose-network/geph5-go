@@ -21,7 +21,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/sillad"
 )
 
 // BoundTcpDialer dials a single TCP address. It mirrors bound_dialer.rs's

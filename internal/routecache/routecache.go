@@ -13,8 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/database"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/database"
 )
 
 // keyPrefix is prepended to every cache key so the route cache does not collide

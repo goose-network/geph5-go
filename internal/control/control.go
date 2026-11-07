@@ -40,10 +40,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/blake3"
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/nanorpc"
-	"github.com/geph-official/geph5-go/internal/session"
+	"github.com/goose-network/geph5-go/internal/blake3"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/nanorpc"
+	"github.com/goose-network/geph5-go/internal/session"
 	"gopkg.in/yaml.v3"
 )
 

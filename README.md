@@ -4,7 +4,7 @@ A Go port of the [geph5](https://github.com/geph-official/geph5) **client core**
 
 This is **not** a reimplementation of the broker or exit side — it speaks the same JSON-RPC, sosistab3/picomux framing, and ed25519-signed route formats as the Rust `geph5-client`, so a Go client connects to a Rust broker and through Rust exits transparently. For single-process deployments, [`internal/exitlib`](#standalone-one-process-operation) also implements the **exit server** side in Go, so the client and the exit can run in one process with no Rust binary at all.
 
-- **Module:** `github.com/geph-official/geph5-go`
+- **Module:** `github.com/goose-network/geph5-go`
 - **Go version:** 1.27
 - **Scope:** the client engine (`binaries/geph5-client` in the Rust workspace). ~14k LOC across 29 packages.
 - **Also:** a provider plugin for the [goose](https://github.com/goose-network/goose) proxy-pool engine (`plugins/geph`) that embeds this client, proven against a real Rust exit with real traffic — and, via its `embedded_exit` option, against the Go exit in the same process.

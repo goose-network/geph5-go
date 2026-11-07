@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/stdcode"
+	"github.com/goose-network/geph5-go/internal/stdcode"
 )
 
 // RelKind mirrors virta::RelKind: the control flag on a Reliable StreamMessage.

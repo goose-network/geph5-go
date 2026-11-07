@@ -6,8 +6,8 @@ import (
 	"crypto/x509"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/blake3"
-	"github.com/geph-official/geph5-go/internal/stdcode"
+	"github.com/goose-network/geph5-go/internal/blake3"
+	"github.com/goose-network/geph5-go/internal/stdcode"
 )
 
 // KeyCount is the number of per-epoch RSA subkeys in a full Mizaru secret

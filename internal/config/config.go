@@ -14,7 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/geph-official/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
 )
 
 // Config mirrors geph5_client::Config.

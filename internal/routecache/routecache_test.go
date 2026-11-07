@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/database"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/database"
 )
 
 func sampleRoute(port uint16) brokerproto.ExitRouteDescriptor {

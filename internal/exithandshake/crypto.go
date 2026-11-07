@@ -27,8 +27,8 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 
-	"github.com/geph-official/geph5-go/internal/blake3"
-	"github.com/geph-official/geph5-go/internal/stdcode"
+	"github.com/goose-network/geph5-go/internal/blake3"
+	"github.com/goose-network/geph5-go/internal/stdcode"
 )
 
 // ClientCryptHello is the client's ephemeral hello payload.

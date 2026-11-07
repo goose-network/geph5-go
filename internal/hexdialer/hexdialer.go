@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/sillad"
 )
 
 // HexPipe hex-encodes all writes and hex-decodes all reads over an inner Pipe.

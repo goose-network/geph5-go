@@ -16,7 +16,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 
-	"github.com/geph-official/geph5-go/internal/blake3"
+	"github.com/goose-network/geph5-go/internal/blake3"
 )
 
 // VerifyError is returned by JsonSigned.Verify / StdcodeSigned.Verify.

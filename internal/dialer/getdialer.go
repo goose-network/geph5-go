@@ -9,15 +9,15 @@ import (
 	"net"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/blake3"
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/conntest"
-	"github.com/geph-official/geph5-go/internal/database"
-	"github.com/geph-official/geph5-go/internal/hexdialer"
-	"github.com/geph-official/geph5-go/internal/meeklike"
-	"github.com/geph-official/geph5-go/internal/routecache"
-	"github.com/geph-official/geph5-go/internal/sillad"
-	"github.com/geph-official/geph5-go/internal/sosistab3"
+	"github.com/goose-network/geph5-go/internal/blake3"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/conntest"
+	"github.com/goose-network/geph5-go/internal/database"
+	"github.com/goose-network/geph5-go/internal/hexdialer"
+	"github.com/goose-network/geph5-go/internal/meeklike"
+	"github.com/goose-network/geph5-go/internal/routecache"
+	"github.com/goose-network/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/sosistab3"
 )
 
 // GetDialer is the route-to-dialer compiler. It mirrors get_dialer() in

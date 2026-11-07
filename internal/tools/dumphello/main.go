@@ -5,7 +5,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/geph-official/geph5-go/internal/exithandshake"
+	"github.com/goose-network/geph5-go/internal/exithandshake"
 )
 
 func main() {

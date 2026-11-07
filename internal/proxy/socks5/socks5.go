@@ -20,7 +20,7 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/geph-official/geph5-go/internal/session"
+	"github.com/goose-network/geph5-go/internal/session"
 )
 
 // Serve binds a SOCKS5 listener to listenAddr and serves connections until

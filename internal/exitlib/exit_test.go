@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/clientlib"
-	"github.com/geph-official/geph5-go/internal/config"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/clientlib"
+	"github.com/goose-network/geph5-go/internal/config"
 )
 
 // mappedV4Loopback is the IPv4-mapped IPv6 literal for 127.0.0.1. It rides the

@@ -14,7 +14,7 @@ import (
 	"io"
 	"math/big"
 
-	"github.com/geph-official/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/sillad"
 )
 
 // Dialer wraps an inner Dialer with a connection-quality ping test.

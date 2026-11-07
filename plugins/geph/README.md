@@ -146,12 +146,12 @@ with no external dependencies.
 ## Wiring into goose
 
 The plugin is bundled with goose (blank-imported by
-[`include/register.go`](../../goose/include/register.go)), pulled in via a
-`require` + `replace` in goose's `go.mod`:
+[`include/register.go`](../../goose/include/register.go)), pulled in with a
+plain `require` in goose's `go.mod` — the module is published at its repo,
+so no `replace` is needed:
 
 ```
-require github.com/geph-official/geph5-go v0.0.0
-replace github.com/geph-official/geph5-go => ../geph5-go
+require github.com/goose-network/geph5-go v0.0.1
 ```
 
 A goose config using it:

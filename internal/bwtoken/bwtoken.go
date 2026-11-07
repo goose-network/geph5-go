@@ -35,12 +35,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/auth"
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/config"
-	"github.com/geph-official/geph5-go/internal/database"
-	"github.com/geph-official/geph5-go/internal/mizaru2"
-	"github.com/geph-official/geph5-go/internal/stdcode"
+	"github.com/goose-network/geph5-go/internal/auth"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/config"
+	"github.com/goose-network/geph5-go/internal/database"
+	"github.com/goose-network/geph5-go/internal/mizaru2"
+	"github.com/goose-network/geph5-go/internal/stdcode"
 )
 
 // BWTokenBytes is the number of bytes of relayed traffic that consumes one

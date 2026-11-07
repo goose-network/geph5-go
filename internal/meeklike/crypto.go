@@ -28,9 +28,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/geph-official/geph5-go/internal/blake3"
-	"github.com/geph-official/geph5-go/internal/chacha20poly1305"
-	"github.com/geph-official/geph5-go/internal/stdcode"
+	"github.com/goose-network/geph5-go/internal/blake3"
+	"github.com/goose-network/geph5-go/internal/chacha20poly1305"
+	"github.com/goose-network/geph5-go/internal/stdcode"
 )
 
 // pskContextUp is the 32-byte blake3 keyed_hash context for client->server

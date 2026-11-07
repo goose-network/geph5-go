@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/brokerproto"
-	"github.com/geph-official/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/sillad"
 )
 
 func TestSplitOnce(t *testing.T) {

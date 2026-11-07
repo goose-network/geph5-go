@@ -53,11 +53,11 @@ import (
 
 	"golang.org/x/crypto/curve25519"
 
-	"github.com/geph-official/geph5-go/internal/blake3"
-	"github.com/geph-official/geph5-go/internal/exithandshake"
-	"github.com/geph-official/geph5-go/internal/picomux"
-	"github.com/geph-official/geph5-go/internal/sillad"
-	"github.com/geph-official/geph5-go/internal/tunnelcmd"
+	"github.com/goose-network/geph5-go/internal/blake3"
+	"github.com/goose-network/geph5-go/internal/exithandshake"
+	"github.com/goose-network/geph5-go/internal/picomux"
+	"github.com/goose-network/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/tunnelcmd"
 )
 
 // handshakeTimeout bounds the conntest + hello phase of a connection. The

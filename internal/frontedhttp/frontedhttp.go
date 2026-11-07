@@ -25,7 +25,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/nanorpc"
+	"github.com/goose-network/geph5-go/internal/nanorpc"
 )
 
 // Transport is a fronted-HTTP nanorpc transport.

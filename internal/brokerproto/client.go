@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/geph-official/geph5-go/internal/nanorpc"
+	"github.com/goose-network/geph5-go/internal/nanorpc"
 )
 
 // BrokerClient wraps a nanorpc transport with typed broker protocol methods.

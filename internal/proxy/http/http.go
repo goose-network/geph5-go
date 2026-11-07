@@ -22,7 +22,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/geph-official/geph5-go/internal/session"
+	"github.com/goose-network/geph5-go/internal/session"
 )
 
 // Serve binds an HTTP proxy listener to listenAddr and serves connections

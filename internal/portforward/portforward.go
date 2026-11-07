@@ -22,7 +22,7 @@ import (
 	"net"
 	"sync"
 
-	"github.com/geph-official/geph5-go/internal/config"
+	"github.com/goose-network/geph5-go/internal/config"
 )
 
 // Serve runs the port-forwarding service. It blocks until ctx is cancelled

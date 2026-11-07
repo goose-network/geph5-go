@@ -14,10 +14,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/geph-official/geph5-go/internal/exithandshake"
-	"github.com/geph-official/geph5-go/internal/picomux"
-	"github.com/geph-official/geph5-go/internal/sillad"
-	"github.com/geph-official/geph5-go/internal/stdcode"
+	"github.com/goose-network/geph5-go/internal/exithandshake"
+	"github.com/goose-network/geph5-go/internal/picomux"
+	"github.com/goose-network/geph5-go/internal/sillad"
+	"github.com/goose-network/geph5-go/internal/stdcode"
 )
 
 func main() {
