@@ -34,12 +34,26 @@
 // exit, completing the X25519+ed25519 handshake, and registering the
 // tunnel — all work the session manager does on its own schedule once started.
 // The provider therefore starts the client in a background goroutine from the
-// factory: Outbounds returns an empty set until the client reports a live
-// session, then signals Watch so the engine repolls promptly and the pool
-// fills without waiting for the 2-minute fallback poll. A failed session
-// (broker unreachable, exit down) is retried indefinitely inside the session
-// manager's workers, so the provider itself has no terminal error path except
-// an invalid config, which fails the factory immediately.
+// factory and, independently of session readiness, polls the broker's net
+// status for the exit roster: Outbounds advertises one outbound per discovered
+// exit as soon as the roster arrives (the geph analogue of psiphon's datastore
+// server list), and adds the general "geph" outbound once a live session
+// exists. Each change signals Watch so the engine repolls promptly instead of
+// waiting for the 2-minute fallback poll. A failed session (broker unreachable,
+// exit down, or no credential) is retried indefinitely inside the session
+// manager's workers, so the provider has no terminal error path except an
+// invalid config, which fails the factory immediately.
+//
+// # Zero-config defaults
+//
+// With no config_path, embedded_exit, or inline exit_constraint/broker, the
+// provider embeds the production geph5 network parameters (the auto exit
+// constraint, the direct broker https://broker.geph.io, and its verification
+// keys — see defaults.go) so it retrieves the live exit roster out of the box,
+// exactly as the psiphon plugin downloads its signed server list with no
+// operator-supplied file. Retrieving the roster needs no account; establishing
+// a tunnel session does (geph is freemium), so a credential remains
+// operator-supplied for traffic while the server list is discovered zero-config.
 //
 // # Config
 //
@@ -599,6 +613,16 @@ func buildClientConfig(pc providerConfig) (*config.Config, error) {
 		cache := pc.Cache
 		cfg.Cache = &cache
 	}
+
+	// Zero-config production case: with no config_path, embedded_exit, or
+	// inline exit_constraint/broker, fill the embedded production network
+	// parameters (auto constraint, direct broker, keys) so the provider
+	// retrieves the live exit roster out of the box, like psiphon's embedded
+	// config. Specific modes (direct pin, custom broker, YAML, standalone)
+	// are left untouched.
+	if zeroConfigProduction(pc) {
+		applyProductionDefaults(cfg)
+	}
 	return cfg, nil
 }
 
@@ -691,26 +715,21 @@ func (p *Provider) run(ctx context.Context, dialer func(ctx context.Context, net
 	p.phase = "connecting"
 	p.mu.Unlock()
 
-	// Wait for a live session (the first tunnel through which traffic can
-	// actually flow) before advertising readiness: without one, every dial
-	// would fail, and advertising early would let the engine hammer a dead
-	// tunnel.
-	if err := p.awaitSession(ctx, client); err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		p.setTerminal(err)
-		return
-	}
-
-	// Sessions may come and go; keep the outbound advertised as long as the
-	// client is up, mirroring how tor's provider advertises as long as its
-	// guard link is alive. SetLiveness ping failures inside a session cause
-	// the session worker to rebuild tunnels automatically.
+	// The broker exit roster is the provider's server-list source — the geph
+	// analogue of psiphon's datastore. Refresh it independently of session
+	// readiness (in this goroutine, blocking until ctx ends) so the real exit
+	// list is retrieved and advertised zero-config, even before — or without —
+	// a live session: a credential-less client still discovers servers, while
+	// tunneling awaits an operator-supplied secret. Each refresh re-signals
+	// Watch so the engine repolls Outbounds; idle per-exit clients are reaped
+	// on the same ticker.
 	//
-	// Alongside the ready loop, poll the broker's net status for the exit
-	// roster (the per-exit outbound source) and reap idle per-exit clients —
-	// both re-signal Watch so the engine repolls Outbounds.
+	// The ready flip runs alongside: when the first live session appears the
+	// general "geph" outbound is advertised too. There is no terminal timeout
+	// — the session manager retries tunnel establishment forever (mirroring
+	// tor/psiphon), so a credential-less zero-config client keeps the roster
+	// advertised in the "connecting" state rather than erroring out.
+	go p.awaitSession(ctx, client)
 	p.refreshLoop(ctx, client)
 }
 
@@ -721,8 +740,9 @@ const exitListInterval = 10 * time.Minute
 
 // refreshLoop blocks until ctx is canceled, periodically refreshing the
 // broker-known exit roster and reaping idle per-exit clients. The FIRST
-// refresh happens immediately after the first live session so the exit list
-// fills the web UI without waiting a full interval.
+// refresh happens immediately after the client starts — independent of session
+// readiness — so the exit list fills the web UI zero-config without waiting for
+// a live session (or a full interval).
 func (p *Provider) refreshLoop(ctx context.Context, client *clientlib.Client) {
 	p.refreshExitsOnce(ctx, client)
 	t := time.NewTicker(exitListInterval)
@@ -807,12 +827,16 @@ func exitsEqual(a, b []exitInfo) bool {
 }
 
 // awaitSession polls the session manager until at least one session is live
-// (so tunnels can carry data), or ctx is canceled.
-func (p *Provider) awaitSession(ctx context.Context, client clientConn) error {
-	deadline := time.Now().Add(5 * time.Minute)
+// (so the general outbound can carry data), flips ready, and returns. It also
+// returns when ctx is canceled. There is no deadline: the session manager
+// retries forever, and a credential-less zero-config client simply never flips
+// ready while the independently-refreshed exit roster stays advertised.
+func (p *Provider) awaitSession(ctx context.Context, client clientConn) {
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
 	for {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return
 		}
 		if client.SessionCount() > 0 {
 			p.mu.Lock()
@@ -822,15 +846,12 @@ func (p *Provider) awaitSession(ctx context.Context, client clientConn) error {
 			p.mu.Unlock()
 			log.Printf("geph provider: geph5 client has a live session")
 			p.signalWatch()
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("geph provider: timed out waiting for a live session")
+			return
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+			return
+		case <-tick.C:
 		}
 	}
 }
@@ -850,14 +871,15 @@ func (p *Provider) Name() string { return "geph" }
 // Watch returns the change signal channel.
 func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 
-// Outbounds returns the current outbound set: empty until the geph5 client
-// has a live session, then the general "geph" outbound PLUS one outbound per
-// broker-known exit — the geph analogue of the psiphon/tor per-server lists,
-// sourced from the broker's net status — so the engine's web UI can show and
-// pin the real exit roster. Per-exit outbounds are named <id>-<hostname>
-// and pin the dial's client to that exit's hostname constraint via the
-// "exit_hostname" config key. A terminal startup failure returns the error
-// so the engine logs it (the existing pool, if any, is kept).
+// Outbounds returns the current outbound set: one outbound per broker-known
+// exit — the geph analogue of the psiphon/tor per-server lists, sourced from
+// the broker's net status — advertised as soon as the roster is retrieved,
+// independent of session readiness, so the engine's web UI can show and pin the
+// real exit list zero-config. The general "geph" outbound (riding the primary
+// client's live session) is added once a session is live. Per-exit outbounds
+// are named <id>-<hostname> and pin the dial's client to that exit's hostname
+// constraint via the "exit_hostname" config key. A terminal startup failure
+// returns the error so the engine logs it (the existing pool, if any, is kept).
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	// Rendezvous point for the idle reaper: every engine poll (~2 min) walks
 	// the pinned clients and stops the ones no dial touched for
@@ -876,19 +898,21 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !ready {
-		return nil, nil
-	}
 
-	out := []pub.OutboundConfig{
-		{
+	// The per-exit roster is advertised as soon as it is retrieved, independent
+	// of session readiness — like psiphon emitting its datastore servers without
+	// waiting for the main tunnel. The general "geph" outbound rides the primary
+	// client's live session, so it is added only once ready.
+	var out []pub.OutboundConfig
+	if ready {
+		out = append(out, pub.OutboundConfig{
 			ID:       id,
 			Protocol: "geph",
 			Config: map[string]any{
 				"id":     id,
 				"tunnel": id,
 			},
-		},
+		})
 	}
 	for _, e := range exits {
 		exitID := id + "-" + e.Hostname

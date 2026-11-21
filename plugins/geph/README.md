@@ -48,15 +48,32 @@ plugin import boundary stays acyclic.
 Establishing a geph5 session means fetching/compiling an exit route, dialing
 the exit, completing the X25519+ed25519 handshake, and registering the tunnel —
 work the session manager does on its own schedule. The provider therefore
-starts the client in a background goroutine from the factory:
+starts the client in a background goroutine from the factory and, independently
+of session readiness, polls the broker's net status for the exit roster:
 
-- `Outbounds()` returns an **empty set** until at least one session is live,
-  then signals `Watch()` so the engine repolls promptly instead of waiting for
-  the 2-minute fallback poll.
-- A failed session (broker unreachable, exit down) is retried indefinitely
-  inside the session manager; the provider's only terminal error paths are an
-  invalid config (fails the factory) and a 5-minute timeout waiting for the
-  first session, both surfaced via `Outbounds()`.
+- `Outbounds()` advertises **one outbound per discovered exit** as soon as the
+  roster is retrieved — the geph analogue of psiphon's datastore server list —
+  and adds the general `geph` outbound once a live session exists. Each change
+  signals `Watch()` so the engine repolls promptly instead of waiting for the
+  2-minute fallback poll.
+- A failed session (broker unreachable, exit down, or no credential) is retried
+  indefinitely inside the session manager; the provider's only terminal error
+  path is an invalid config (fails the factory), surfaced via `Outbounds()`. A
+  credential-less zero-config client keeps the roster advertised in the
+  `connecting` state rather than erroring out.
+
+## Zero-config defaults
+
+With no `config_path`, `embedded_exit`, or inline `exit_constraint`/`broker`,
+the provider embeds the production geph5 network parameters — the `auto` exit
+constraint, the direct broker `https://broker.geph.io`, and its verification
+keys (`defaults.go`) — so it retrieves the live exit roster out of the box,
+exactly as the psiphon plugin downloads its signed server list with no
+operator-supplied file. Retrieving the roster (`get_net_status`) needs no
+account; establishing a tunnel session does (geph is freemium — the production
+broker rejects the `test_dummy` credential), so a `secret` (or other credential)
+remains operator-supplied for traffic while the server list is discovered
+zero-config.
 
 ## Config
 
@@ -81,20 +98,27 @@ config where they make sense as provider knobs:
 | `config_path` | — | Full client YAML (`config.LoadYAML` format; see the module README) as the base config. |
 | `embedded_exit` | — | Standalone mode: boot the geph5 exit in-process (see below). `true` or `{ "listen", "allow_loopback", "seed_hex" }`. |
 | `outbound_id` | `geph` | The goose outbound id the provider advertises; the `"geph"` outbound resolves its tunnel by this id at dial time. |
-| `exit_constraint` | — | The client's exit constraint in its native enum shape: `"auto"`, `{"direct": "host:port/pubkeyhex"}`, `{"hostname": "..."}`, etc. |
+| `exit_constraint` | `auto` * | The client's exit constraint in its native enum shape: `"auto"`, `{"direct": "host:port/pubkeyhex"}`, `{"hostname": "..."}`, etc. |
 | `credentials` | — | Full credential object, when a broker is used (`{"secret": ...}`, `"test_dummy"`, or `{"legacy_username_password": {...}}`). |
 | `secret` | — | Shorthand for `credentials: {secret: ...}`. |
 | `username` / `password` | — | Shorthand for the legacy credential. |
 | `cache` | in-memory | Persistent client cache (routecache/auth) path. |
-| `broker` | — | Broker source: a bare URL string (direct) or a tagged object (`{"fronted": {...}}`). |
-| `broker_keys` | — | Broker verification keys, required with a broker. |
+| `broker` | `https://broker.geph.io` * | Broker source: a bare URL string (direct) or a tagged object (`{"fronted": {...}}`). |
+| `broker_keys` | embedded production keys * | Broker verification keys, required with a broker. |
+
+\* These defaults apply only in the **zero-config** case (no `config_path`,
+`embedded_exit`, or inline `exit_constraint`/`broker`); see
+[Zero-config defaults](#zero-config-defaults). Any explicit mode is left untouched.
 
 `config_path` loads a static YAML; the inline keys (when present) are applied on
 top of it, so a shared YAML can be reused while the plugin overrides the exit
 constraint.
 
-Three shapes cover the common cases:
+Four shapes cover the common cases:
 
+- **Zero-config (default)** — supply nothing (optionally a `secret` for traffic):
+  the embedded production broker/keys and `auto` constraint retrieve and
+  advertise the live exit roster out of the box, like psiphon.
 - **Broker mode** — set `broker`, `broker_keys`, credentials, and
   `exit_constraint: "auto"` (or a country/id constraint); the session manager
   fetches signed routes like the standalone client.
