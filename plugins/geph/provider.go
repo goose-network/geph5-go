@@ -122,6 +122,10 @@ import (
 
 func init() {
 	pub.RegisterProvider("geph", NewProvider)
+	// Zero-config: the embedded production broker/keys retrieve the exit
+	// roster with an empty config map, so the engine auto-seeds a geph
+	// provider — it appears in the admin UI without operator setup.
+	pub.RegisterDefaultProvider(pub.DefaultProvider{Provider: "geph"})
 }
 
 // liveProviders holds the running geph providers keyed by their contributed
