@@ -16,9 +16,13 @@
 //
 // Embedders that keep the client inside their own process boundary (the goose
 // plugin) set NoListener and dial in process via Client.OpenConn, and pass
-// StackDialer so the client's own TCP — broker RPCs and the route tree to the
+// StackDialer so the client's data-path TCP — the compiled route tree to the
 // exit — goes through the embedder's network stack rather than the raw system
-// dialer.
+// dialer. BrokerDialer separately carries the control plane (the broker RPCs
+// that fetch the exit roster, auth tokens, and exit routes): the goose plugin
+// rides its provider upstream_proxy on that dialer only, keeping the
+// outbounds' own exit dials off the upstream. When BrokerDialer is nil it
+// falls back to StackDialer, the historical single-dialer behavior.
 package clientlib
 
 import (
@@ -52,11 +56,20 @@ type Options struct {
 	// engine and the embedded client.
 	NoListener bool
 
-	// StackDialer, when non-nil, establishes every raw TCP connection the
-	// client itself makes (to the broker, and through the route tree to the
-	// exit) instead of the system dialer — the embedding process's network
-	// stack. Nil is the system dialer, exactly as before.
+	// StackDialer, when non-nil, establishes the client's data-path TCP — the
+	// raw connections of the compiled route tree to the exit (every
+	// BoundTcpDialer) — instead of the system dialer: the embedding process's
+	// network stack. It does not carry the broker RPCs when BrokerDialer is
+	// set. Nil is the system dialer, exactly as before.
 	StackDialer func(ctx context.Context, network, address string) (net.Conn, error)
+
+	// BrokerDialer, when non-nil, establishes the control-plane TCP — the
+	// broker transport's raw connections (roster/net-status fetches, auth
+	// RPCs, exit-route requests) — instead of StackDialer. The goose plugin
+	// wires its provider upstream_proxy route here so only the server-list
+	// fetches ride the upstream, never the outbounds' exit dials. Nil falls
+	// back to StackDialer (the historical single-dialer behavior).
+	BrokerDialer func(ctx context.Context, network, address string) (net.Conn, error)
 
 	// Config is the client configuration (exit constraint, credentials,
 	// broker, ...). Required: a config with no exit constraint cannot start.
@@ -72,7 +85,7 @@ type Client struct {
 
 	sessMgr   *session.Manager
 	openConn  func(ctx context.Context, remote string) (net.Conn, error)
-	socksAddr string // the address the SOCKS5 listener actually bound ("" with NoListener)
+	socksAddr string                    // the address the SOCKS5 listener actually bound ("" with NoListener)
 	broker    *brokerproto.BrokerClient // nil when no broker source is configured
 }
 
@@ -109,7 +122,14 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 	// Broker client. A missing/unbuildable broker is non-fatal — it only
 	// disables broker-dependent features (auth fetch, route-broker cache,
 	// non-direct exit constraints), exactly like cmd/geph-client/main.go.
-	broker, err := BuildBrokerClient(cfg, opts.StackDialer)
+	// The broker transport rides BrokerDialer (the control plane), falling
+	// back to StackDialer when unset; the session manager below keeps
+	// StackDialer for the exit route tree (the data path).
+	brokerDialer := opts.BrokerDialer
+	if brokerDialer == nil {
+		brokerDialer = opts.StackDialer
+	}
+	broker, err := BuildBrokerClient(cfg, brokerDialer)
 	if err != nil {
 		log.Printf("clientlib: could not build broker client: %v (broker-dependent features disabled)", err)
 		broker = nil

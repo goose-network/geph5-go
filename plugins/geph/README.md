@@ -18,17 +18,26 @@ goose inbound ──▶ pool ──▶ "geph" outbound ──▶ OpenConn (in pr
                               Rust geph5-exit ──▶ internet
 ```
 
-The client's own TCP — broker RPCs (including domain-fronted ones) and the
-compiled route tree to the exit — dials through **the engine**: when the
-provider spec's `upstream_proxy` names a goose route (`outbound:`/`pool:`/
-`chain:`), the injected route dialer (`goose-plugin-api`'s `UpstreamDialer`)
-carries every client connection, so the whole client — broker, route tree,
-exit dials — rides that outbound/pool/chain (whose own outermost hop rides
-the engine stack). Without a route, the engine's stack dialer
-(`StackDialer` — layer 2/3/4, the system kernel stack or the gvisor
-netstack) takes the slot. The plugin hands whichever it has to the client as
-`clientlib.Options.StackDialer`, which threads it down to every TCP dialer
-in the route tree and the broker transport.
+The client's own TCP dials through **the engine**, split by role:
+
+- **Broker fetches (control plane)** — the RPCs that retrieve the exit roster
+  (`get_net_status`), auth tokens, and exit routes, including domain-fronted
+  ones — ride the provider spec's `upstream_proxy` when it names a goose route
+  (`outbound:`/`pool:`/`chain:`): the injected route dialer
+  (`goose-plugin-api`'s `UpstreamDialer`) becomes
+  `clientlib.Options.BrokerDialer`, so only the server-list fetches ride that
+  outbound/pool/chain. Without a route they ride the engine stack dialer.
+- **Exit dials (data path)** — the compiled route tree to the exit (sosistab3,
+  plain TLS, meeklike, TCP hops), including every pinned per-exit client —
+  **never** ride the provider upstream. They use the engine's stack dialer
+  (`StackDialer` — layer 2/3/4, the system kernel stack or the gvisor
+  netstack) as `clientlib.Options.StackDialer`, which threads it down to every
+  TCP dialer in the route tree, or the system dialer when none is injected.
+
+This is the provider-level `upstream_proxy` contract: it routes the plugin's
+proxy-server-list fetches, not the outbounds' own traffic. (The separate
+outbound-level `upstream_proxy` — an engine route injected per outbound spec —
+is unrelated and unaffected.)
 
 With the `embedded_exit` option the last hop changes: a **Go** geph5 exit
 (`geph5-go`'s `internal/exitlib`) runs inside the provider's own process, so
@@ -53,9 +62,12 @@ of session readiness, polls the broker's net status for the exit roster:
 
 - `Outbounds()` advertises **one outbound per discovered exit** as soon as the
   roster is retrieved — the geph analogue of psiphon's datastore server list —
-  and adds the general `geph` outbound once a live session exists. Each change
-  signals `Watch()` so the engine repolls promptly instead of waiting for the
-  2-minute fallback poll.
+  and adds the general `geph` outbound once a live session exists. Per-exit
+  ids are `<outbound_id>-<hostname>-<host:port>`: the exit's c2e address is
+  part of the id so the server it pins is visible at a glance (the general
+  outbound keeps its plain id — it rides a live session, not one server). Each
+  change signals `Watch()` so the engine repolls promptly instead of waiting
+  for the 2-minute fallback poll.
 - A failed session (broker unreachable, exit down, or no credential) is retried
   indefinitely inside the session manager; the provider's only terminal error
   path is an invalid config (fails the factory), surfaced via `Outbounds()`. A

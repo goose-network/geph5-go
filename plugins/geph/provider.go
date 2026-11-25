@@ -10,16 +10,20 @@
 // hop between goose and the embedded client; the client binds no listener at
 // all.
 //
-// The client's own TCP — broker RPCs (including domain-fronted ones) and the
+// The client's own TCP dials through the engine, split by role. The control
+// plane — the broker RPCs (including domain-fronted ones) that fetch the exit
+// roster, auth tokens, and exit routes — rides the provider spec's
+// upstream_proxy when it names a goose route (outbound:/pool:/chain:): the
+// engine injects its route dialer (goose-plugin-api's UpstreamDialer) and the
+// plugin hands it to clientlib as Options.BrokerDialer, so only the
+// server-list fetches ride that outbound/pool/chain. The data path — the
 // compiled route tree to the exit (sosistab3, plain TLS, meeklike, TCP
-// hops) — dials through the engine: when the provider spec's upstream_proxy
-// names a goose route (outbound:/pool:/chain:), the engine injects its route
-// dialer (goose-plugin-api's UpstreamDialer), which carries every connection
-// so the whole client rides that outbound/pool/chain; otherwise the engine's
-// stack dialer (StackDialer — layer 2/3/4, system kernel or gvisor netstack)
-// takes the slot. The plugin hands whichever it has to clientlib as
-// Options.StackDialer, which threads it down to every BoundTcpDialer and the
-// broker transport.
+// hops), including every pinned per-exit client — never rides the provider
+// upstream: it uses the engine's stack dialer (StackDialer — layer 2/3/4,
+// system kernel or gvisor netstack) injected under pub.StackDialerKey, handed
+// to clientlib as Options.StackDialer, or the system dialer when none is
+// injected. Without an upstream route the broker fetches ride the stack
+// dialer too.
 //
 // This package lives inside the geph5-go module (not a separate repo) because
 // it embeds geph5-go's internal packages (internal/clientlib → internal/auth,
@@ -159,7 +163,8 @@ type clientConn interface {
 }
 
 // exitInfo is one broker-known exit, in the form the provider emits and the
-// web UI shows. The hostname is the constraint a per-exit dial pins.
+// web UI shows. The hostname is the constraint a per-exit dial pins; C2EListen
+// is the exit's client-facing host:port, appended to the per-exit outbound id.
 type exitInfo struct {
 	Hostname  string
 	PubkeyHex string
@@ -220,13 +225,18 @@ type Provider struct {
 	// pinnedDialer starts per-exit clients lazily; swapped for a fake in tests.
 	pinnedDialer func(ctx context.Context, hostname string) (clientConn, error)
 
-	// engineDialer is the dialer threaded into every started client — the
+	// brokerDialer carries the client's control plane — the broker transport
+	// (roster/net-status fetches, auth RPCs, exit-route requests): the
 	// injected upstream route's dialer when the spec's upstream_proxy names
-	// a goose route, else the engine's layer-3/4 stack dialer — stored at
+	// a goose route, else the engine's layer-3/4 stack dialer. stackDialer
+	// carries the data path — the exit route tree's raw TCP, including every
+	// pinned per-exit client — and is always the engine stack dialer (or nil
+	// for the system dialer), never the provider upstream. Both are stored at
 	// factory time because per-exit clients are started later, from the dial
-	// path, where it is no longer reachable.
-	engineDialer func(ctx context.Context, network, address string) (net.Conn, error)
-	// viaRoute records that engineDialer came from an injected engine route
+	// path, where the config map is no longer reachable.
+	brokerDialer func(ctx context.Context, network, address string) (net.Conn, error)
+	stackDialer  func(ctx context.Context, network, address string) (net.Conn, error)
+	// viaRoute records that brokerDialer came from an injected engine route
 	// (the spec's upstream_proxy names an outbound:/pool:/chain:); surfaced
 	// through Status details as "engine_route".
 	viaRoute bool
@@ -315,25 +325,29 @@ func (o embeddedExitOptions) exitlibOptions() (exitlib.Options, error) {
 	return opts, nil
 }
 
-// engineDialer resolves the engine-injected dialer the client's own TCP
-// rides: the upstream route dialer when the provider spec's upstream_proxy
-// names a goose route (outbound:/pool:/chain: — the engine injects it under
-// pub.UpstreamDialerKey), else the engine's layer-3/4 stack dialer, else nil
-// (the system dialer, e.g. unit tests). viaRoute reports the route case.
-func engineDialer(cfg map[string]any) (dial func(ctx context.Context, network, address string) (net.Conn, error), viaRoute bool) {
-	if ud := pub.AsUpstreamDialer(cfg); ud != nil {
-		return ud.DialUpstream, true
-	}
+// engineDialers resolves the two engine-injected dialers by role. brokerDialer
+// carries the client's control plane (the broker transport): the upstream
+// route dialer when the provider spec's upstream_proxy names a goose route
+// (outbound:/pool:/chain: — the engine injects it under pub.UpstreamDialerKey),
+// else the engine's layer-3/4 stack dialer, else nil (the system dialer, e.g.
+// unit tests). stackDialer carries the data path (the exit route tree's raw
+// TCP): the engine's stack dialer only — the provider upstream must never
+// carry the outbounds' own server dials — else nil. viaRoute reports the route
+// case.
+func engineDialers(cfg map[string]any) (brokerDialer, stackDialer func(ctx context.Context, network, address string) (net.Conn, error), viaRoute bool) {
 	if sd := pub.AsStackDialer(cfg); sd != nil {
-		return sd.Dial, false
+		stackDialer = sd.Dial
 	}
-	return nil, false
+	if ud := pub.AsUpstreamDialer(cfg); ud != nil {
+		return ud.DialUpstream, stackDialer, true
+	}
+	return stackDialer, stackDialer, false
 }
 
 // NewProvider is the ProviderFactory registered as "geph". It parses the
 // config and starts the geph5 client bootstrap in the background; Outbounds
-// returns a "geph" outbound once the client has a live session, and an empty
-// set before.
+// advertises the broker-known exit roster as soon as it is retrieved and adds
+// the general "geph" outbound once the client has a live session.
 func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	pc, err := parseConfig(cfg)
 	if err != nil {
@@ -343,19 +357,21 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 		pc.OutboundID = "geph"
 	}
 
-	// Route the client's own TCP (broker RPCs, exit route tree) through the
-	// engine — the injected upstream route when the spec's upstream_proxy
-	// names a goose outbound/pool/chain, else the engine's layer-3/4 stack
-	// (system kernel or gvisor netstack) — rather than the raw system dialer.
-	// When neither is injected (e.g. unit tests) the client falls back to the
-	// system dialer.
-	dialer, viaRoute := engineDialer(cfg)
+	// Route the client's own TCP through the engine, split by role: broker
+	// fetches (the control plane) ride the injected upstream route when the
+	// spec's upstream_proxy names a goose outbound/pool/chain, else the
+	// engine's layer-3/4 stack (system kernel or gvisor netstack); exit dials
+	// (the data path) ride the engine stack only, never the provider
+	// upstream. When neither is injected (e.g. unit tests) the client falls
+	// back to the system dialer.
+	brokerDialer, stackDialer, viaRoute := engineDialers(cfg)
 
 	p := &Provider{
 		cfg:          pc,
 		watchCh:      make(chan struct{}, 1),
 		stopped:      make(chan struct{}),
-		engineDialer: dialer,
+		brokerDialer: brokerDialer,
+		stackDialer:  stackDialer,
 		viaRoute:     viaRoute,
 	}
 	p.pinnedDialer = p.startExitClient
@@ -363,7 +379,7 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	p.stop = cancel
 	go func() {
 		defer close(p.stopped)
-		p.run(ctx, dialer)
+		p.run(ctx)
 	}()
 	registerLiveProvider(p)
 	return p, nil
@@ -463,7 +479,8 @@ func (p *Provider) awaitExitSession(ctx context.Context, client clientConn) erro
 // startExitClient boots a full embedded geph5 client whose exit constraint is
 // pinned to hostname. It is the production pinnedDialer; tests swap it. The
 // client's context is canceled by Close, so pinned clients stop with the
-// provider.
+// provider. Like the primary client, its broker fetches ride brokerDialer
+// (the provider upstream when injected) and its exit dials ride stackDialer.
 func (p *Provider) startExitClient(ctx context.Context, hostname string) (clientConn, error) {
 	clientCfg, err := buildClientConfig(p.cfg)
 	if err != nil {
@@ -475,9 +492,10 @@ func (p *Provider) startExitClient(ctx context.Context, hostname string) (client
 	p.exitCancels = append(p.exitCancels, cancel)
 	p.mu.Unlock()
 	client, err := clientlib.Start(cancelCtx, clientlib.Options{
-		NoListener:  true,
-		StackDialer: p.engineDialer,
-		Config:      clientCfg,
+		NoListener:   true,
+		StackDialer:  p.stackDialer,
+		BrokerDialer: p.brokerDialer,
+		Config:       clientCfg,
 	})
 	if err != nil {
 		cancel()
@@ -514,7 +532,8 @@ func (p *Provider) reapExitClients() {
 // parseConfig marshals the plugin config map into providerConfig. The
 // engine-injected dialer values (func/interface under the reserved
 // "_dialer"/"_upstream_dialer" keys) are dropped first: they are consumed
-// via AsStackDialer in NewProvider, and json.Marshal would choke on them.
+// via AsStackDialer/AsUpstreamDialer in NewProvider, and json.Marshal would
+// choke on them.
 func parseConfig(cfg map[string]any) (providerConfig, error) {
 	cfg = maps.Clone(cfg)
 	delete(cfg, pub.StackDialerKey)
@@ -663,7 +682,7 @@ func quoteJSONString(s string) string {
 // is canceled; clientlib owns the client's internal retry semantics, so
 // unlike the tor provider there is no backoff loop here — the session manager
 // already retries tunnel establishment forever.
-func (p *Provider) run(ctx context.Context, dialer func(ctx context.Context, network, address string) (net.Conn, error)) {
+func (p *Provider) run(ctx context.Context) {
 	p.setPhase("starting")
 	clientCfg, err := buildClientConfig(p.cfg)
 	if err != nil {
@@ -703,12 +722,14 @@ func (p *Provider) run(ctx context.Context, dialer func(ctx context.Context, net
 	}
 
 	// NoListener: nothing binds — the "geph" outbound dials the session
-	// manager in process via Client.OpenConn. dialer carries the engine
-	// (injected route, else layer-3/4 stack) into the client's connections.
+	// manager in process via Client.OpenConn. The engine dialers split by
+	// role: brokerDialer (injected upstream route, else layer-3/4 stack)
+	// carries the broker fetches; stackDialer carries the exit route tree.
 	client, err := clientlib.Start(ctx, clientlib.Options{
-		NoListener:  true,
-		StackDialer: dialer,
-		Config:      clientCfg,
+		NoListener:   true,
+		StackDialer:  p.stackDialer,
+		BrokerDialer: p.brokerDialer,
+		Config:       clientCfg,
 	})
 	if err != nil {
 		p.setTerminal(err)
@@ -881,9 +902,12 @@ func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 // independent of session readiness, so the engine's web UI can show and pin the
 // real exit list zero-config. The general "geph" outbound (riding the primary
 // client's live session) is added once a session is live. Per-exit outbounds
-// are named <id>-<hostname> and pin the dial's client to that exit's hostname
-// constraint via the "exit_hostname" config key. A terminal startup failure
-// returns the error so the engine logs it (the existing pool, if any, is kept).
+// are named <id>-<hostname>-<host:port>: the exit's c2e address is appended so
+// the id itself carries the proxy server it pins (the general outbound keeps
+// its plain id — it rides a live session, not one server). The dial is pinned
+// to that exit's hostname constraint via the "exit_hostname" config key. A
+// terminal startup failure returns the error so the engine logs it (the
+// existing pool, if any, is kept).
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	// Rendezvous point for the idle reaper: every engine poll (~2 min) walks
 	// the pinned clients and stops the ones no dial touched for
@@ -918,8 +942,23 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 			},
 		})
 	}
+	seen := map[string]int{}
 	for _, e := range exits {
+		// Append the exit's c2e address so the id carries the proxy server's
+		// host:port literally (the subscription/mihomo id convention). The
+		// hostname stays the dial pin; exits without a known address keep the
+		// plain hostname id.
 		exitID := id + "-" + e.Hostname
+		if e.C2EListen != "" {
+			exitID += "-" + e.C2EListen
+		}
+		// Hostnames are unique broker-map keys, but a hostname containing a
+		// dash could still concatenate into another exit's id+address; the
+		// subscription-style suffix keeps every id unique regardless.
+		seen[exitID]++
+		if n := seen[exitID]; n > 1 {
+			exitID = fmt.Sprintf("%s-%d", exitID, n)
+		}
 		out = append(out, pub.OutboundConfig{
 			ID:       exitID,
 			Protocol: "geph",
@@ -955,7 +994,7 @@ func (p *Provider) Status() pub.ProviderStatus {
 	refreshAt := p.refreshAt
 	refreshErr := p.refreshErr
 	exits := len(p.exits)
-	dialer, viaRoute := p.engineDialer, p.viaRoute
+	stackDialer, viaRoute := p.stackDialer, p.viaRoute
 	exitAddr, exitPubkey := "", ""
 	if p.exit != nil {
 		exitAddr = p.exit.C2EAddr()
@@ -976,11 +1015,13 @@ func (p *Provider) Status() pub.ProviderStatus {
 	details := map[string]any{
 		"mode":            "broker",
 		"exits_in_roster": exits,
-		// Transport of the client's own dials: an injected engine route
-		// (spec upstream_proxy naming outbound:/pool:/chain:) or the engine
-		// layer-3/4 stack.
+		// Transport split: broker fetches ride an injected engine route
+		// (spec upstream_proxy naming outbound:/pool:/chain:) when present
+		// (engine_route), else the engine stack; exit dials — the outbounds'
+		// data path — ride the engine layer-3/4 stack (engine_stack), never
+		// the provider upstream. Both can hold at once.
 		"engine_route": viaRoute,
-		"engine_stack": dialer != nil && !viaRoute,
+		"engine_stack": stackDialer != nil,
 	}
 	if exitAddr != "" {
 		details["mode"] = "embedded_exit"

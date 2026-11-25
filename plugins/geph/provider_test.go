@@ -3,17 +3,26 @@ package geph
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	pub "github.com/goose-network/goose-plugin-api"
+
+	"github.com/goose-network/geph5-go/internal/brokerproto"
+	"github.com/goose-network/geph5-go/internal/nanorpc"
 )
 
 func TestParseConfig(t *testing.T) {
@@ -453,7 +462,9 @@ func (staticDialer) Dial(ctx context.Context, network, address string) (net.Conn
 
 // TestOutboundsEmitPerExit covers the per-exit list form: with a stored exit
 // roster, Outbounds emits the general outbound plus one per exit, carrying
-// the hostname that pins the dial's client and the display fields.
+// the hostname that pins the dial's client and the display fields. Each
+// per-exit id appends the exit's c2e host:port so the id itself shows the
+// proxy server; an exit with no known address keeps the plain hostname id.
 func TestOutboundsEmitPerExit(t *testing.T) {
 	p := &Provider{
 		cfg:     providerConfig{OutboundID: "geph-list"},
@@ -465,6 +476,7 @@ func TestOutboundsEmitPerExit(t *testing.T) {
 	p.exits = []exitInfo{
 		{Hostname: "tokyo1.example", PubkeyHex: "aa", C2EListen: "1.2.3.4:7000", Country: "JP", City: "Tokyo"},
 		{Hostname: "berlin1.example", PubkeyHex: "bb", C2EListen: "5.6.7.8:7001", Country: "DE", City: "Berlin"},
+		{Hostname: "addrless.example", PubkeyHex: "cc", Country: "FR"},
 	}
 	p.mu.Unlock()
 
@@ -472,8 +484,8 @@ func TestOutboundsEmitPerExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Outbounds: %v", err)
 	}
-	if len(out) != 3 {
-		t.Fatalf("got %d outbounds, want 3 (general + 2 exits)", len(out))
+	if len(out) != 4 {
+		t.Fatalf("got %d outbounds, want 4 (general + 3 exits)", len(out))
 	}
 	if out[0].ID != "geph-list" {
 		t.Fatalf("out[0].ID = %q, want the general outbound first", out[0].ID)
@@ -482,12 +494,16 @@ func TestOutboundsEmitPerExit(t *testing.T) {
 		t.Fatal("general outbound must not carry an exit pin")
 	}
 	for i, want := range []struct{ id, host, addr, country string }{
-		{"geph-list-berlin1.example", "berlin1.example", "5.6.7.8:7001", "DE"},
-		{"geph-list-tokyo1.example", "tokyo1.example", "1.2.3.4:7000", "JP"},
+		{"geph-list-addrless.example", "addrless.example", "", "FR"},
+		{"geph-list-berlin1.example-5.6.7.8:7001", "berlin1.example", "5.6.7.8:7001", "DE"},
+		{"geph-list-tokyo1.example-1.2.3.4:7000", "tokyo1.example", "1.2.3.4:7000", "JP"},
 	} {
 		got := out[1+i]
 		if got.ID != want.id || got.Protocol != "geph" {
 			t.Fatalf("per-exit outbound %d = %q (%s), want %q", i, got.ID, got.Protocol, want.id)
+		}
+		if got.Config["id"] != got.ID {
+			t.Fatalf("outbound %s config id = %v, want equal to the outbound id", got.ID, got.Config["id"])
 		}
 		if host, _ := got.Config["exit_hostname"].(string); host != want.host {
 			t.Fatalf("outbound %s exit_hostname = %q, want %q", got.ID, host, want.host)
@@ -501,6 +517,43 @@ func TestOutboundsEmitPerExit(t *testing.T) {
 		if tunnel, _ := got.Config["tunnel"].(string); tunnel != "geph-list" {
 			t.Fatalf("outbound %s tunnel = %q, want geph-list", got.ID, tunnel)
 		}
+	}
+}
+
+// TestOutboundsPerExitIDDedup covers the duplicate-suffix guard: hostnames are
+// unique broker-map keys, but a dash-containing hostname can concatenate into
+// another exit's id+address. The colliding id gets a numeric suffix instead of
+// clobbering its twin (the subscription plugin's dedup convention).
+func TestOutboundsPerExitIDDedup(t *testing.T) {
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "geph-dup"},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+	}
+	p.mu.Lock()
+	p.exits = []exitInfo{
+		// Sorted by hostname: "a" first, then "a-1.2.3.4:7000". Both
+		// concatenate to geph-dup-a-1.2.3.4:7000.
+		{Hostname: "a", C2EListen: "1.2.3.4:7000"},
+		{Hostname: "a-1.2.3.4:7000"},
+	}
+	p.mu.Unlock()
+
+	out, err := p.Outbounds(context.Background())
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("got %d outbounds, want 2", len(out))
+	}
+	if out[0].ID != "geph-dup-a-1.2.3.4:7000" {
+		t.Fatalf("out[0].ID = %q", out[0].ID)
+	}
+	if out[1].ID != "geph-dup-a-1.2.3.4:7000-2" {
+		t.Fatalf("out[1].ID = %q, want the dedup suffix", out[1].ID)
+	}
+	if out[1].Config["id"] != out[1].ID {
+		t.Fatalf("deduped config id = %v, want %q", out[1].Config["id"], out[1].ID)
 	}
 }
 
@@ -872,18 +925,18 @@ func deadPipe(ctx context.Context) (net.Conn, error) {
 	return a, nil
 }
 
-// TestEngineDialerPrecedence verifies the dialer resolution: an injected
-// upstream route (the spec's upstream_proxy naming a goose route) outranks
-// the engine stack dialer, the stack takes the slot only without a route,
-// and a bare config yields the system dialer.
-func TestEngineDialerPrecedence(t *testing.T) {
-	d, viaRoute := engineDialer(map[string]any{})
-	if d != nil || viaRoute {
-		t.Fatalf("bare config: dialer=%T viaRoute=%v, want nil,false", d, viaRoute)
+// TestEngineDialersPrecedence verifies the dialer resolution by role: the
+// broker (fetch) dialer is the injected upstream route when present, else the
+// engine stack; the data-path dialer is ALWAYS the engine stack (never the
+// route), or nil when none is injected; a bare config yields system dialers.
+func TestEngineDialersPrecedence(t *testing.T) {
+	b, s, viaRoute := engineDialers(map[string]any{})
+	if b != nil || s != nil || viaRoute {
+		t.Fatalf("bare config: broker=%T stack=%T viaRoute=%v, want nil,nil,false", b, s, viaRoute)
 	}
 
 	routeRec, stackRec := &dialRecorder{}, &dialRecorder{}
-	d, viaRoute = engineDialer(map[string]any{
+	b, s, viaRoute = engineDialers(map[string]any{
 		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
 		pub.StackDialerKey:    fakeStackDialer{stackRec},
 	})
@@ -892,36 +945,61 @@ func TestEngineDialerPrecedence(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := d(ctx, "tcp", "broker.example:7000"); err != nil {
-		t.Fatalf("route dial: %v", err)
+	if _, err := b(ctx, "tcp", "broker.example:7000"); err != nil {
+		t.Fatalf("broker dial: %v", err)
 	}
 	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp broker.example:7000" {
-		t.Fatalf("route dials = %v, want exactly the one dial", got)
+		t.Fatalf("route dials = %v, want exactly the one broker dial", got)
 	}
 	if got := stackRec.recorded(); len(got) != 0 {
-		t.Fatalf("engine stack dialed although a route was injected: %v", got)
+		t.Fatalf("engine stack dialed for a broker fetch under a route: %v", got)
+	}
+	// The data path rides the stack even though a route is injected.
+	if _, err := s(ctx, "tcp", "exit.example:7000"); err != nil {
+		t.Fatalf("data-path dial: %v", err)
+	}
+	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp exit.example:7000" {
+		t.Fatalf("stack dials = %v, want exactly the one exit dial", got)
+	}
+	if got := routeRec.recorded(); len(got) != 1 {
+		t.Fatalf("route carried a data-path dial: %v", got)
 	}
 
 	stackOnly := &dialRecorder{}
-	d, viaRoute = engineDialer(map[string]any{
+	b, s, viaRoute = engineDialers(map[string]any{
 		pub.StackDialerKey: fakeStackDialer{stackOnly},
 	})
-	if d == nil || viaRoute {
-		t.Fatalf("stack-only: dialer set=%t viaRoute=%v, want dialer,false", d != nil, viaRoute)
+	if b == nil || s == nil || viaRoute {
+		t.Fatalf("stack-only: broker set=%t stack set=%t viaRoute=%v, want true,true,false", b != nil, s != nil, viaRoute)
 	}
-	if _, err := d(ctx, "tcp", "broker.example:7000"); err != nil {
-		t.Fatalf("stack dial: %v", err)
+	if _, err := b(ctx, "tcp", "broker.example:7000"); err != nil {
+		t.Fatalf("stack broker dial: %v", err)
 	}
-	if got := stackOnly.recorded(); len(got) != 1 {
-		t.Fatalf("stack dials = %v, want exactly the one dial", got)
+	if _, err := s(ctx, "tcp", "exit.example:7000"); err != nil {
+		t.Fatalf("stack data dial: %v", err)
+	}
+	if got := stackOnly.recorded(); len(got) != 2 {
+		t.Fatalf("stack dials = %v, want both roles on the stack", got)
+	}
+
+	// Route without a stack: fetches ride the route, the data path falls back
+	// to the system dialer (nil) — never to the route.
+	routeOnly := &dialRecorder{}
+	b, s, viaRoute = engineDialers(map[string]any{
+		pub.UpstreamDialerKey: fakeUpstreamDialer{routeOnly},
+	})
+	if b == nil || s != nil || !viaRoute {
+		t.Fatalf("route-only: broker set=%t stack=%T viaRoute=%v, want true,nil,true", b != nil, s, viaRoute)
 	}
 }
 
-// TestNewProviderRouteCarriesClientDials verifies the factory behavior: with
-// an injected engine route the client's own dials (the pinned exit's route
-// tree) ride the route — observable on the fake's recorder — and Status
-// reports engine_route, not engine_stack.
-func TestNewProviderRouteCarriesClientDials(t *testing.T) {
+// TestNewProviderExitDialsBypassUpstream verifies the factory's data-path
+// contract: with an injected engine route AND stack dialer, the client's exit
+// dials (the pinned direct constraint's route tree) ride the STACK — the
+// provider upstream carries only broker fetches, and this broker-less client
+// makes none, so the route recorder stays empty. Status reports both
+// engine_route (fetch slot) and engine_stack (data-path slot).
+func TestNewProviderExitDialsBypassUpstream(t *testing.T) {
 	routeRec, stackRec := &dialRecorder{}, &dialRecorder{}
 	p, err := NewProvider(map[string]any{
 		"outbound_id":         "geph-route",
@@ -938,28 +1016,181 @@ func TestNewProviderRouteCarriesClientDials(t *testing.T) {
 	if !prov.viaRoute {
 		t.Fatal("provider does not record the injected route")
 	}
-	if prov.engineDialer == nil {
-		t.Fatal("provider has no engine dialer threaded")
+	if prov.brokerDialer == nil || prov.stackDialer == nil {
+		t.Fatal("provider has not threaded both engine dialers")
 	}
 
-	// The session manager dials the pinned exit through the route and keeps
-	// retrying (nothing answers on the dead pipe); poll for the first dial.
-	deadline := time.Now().Add(10 * time.Second)
-	for len(routeRec.recorded()) == 0 && time.Now().Before(deadline) {
+	// The session manager dials the pinned exit through the engine stack and
+	// keeps retrying (nothing answers on the dead pipe); poll for the first
+	// dial. No credential ever refreshes here, so the first dial waits out the
+	// connect-token window (~10s) — the budget must clear that gate with
+	// margin, as TestPinnedExitClientDialerSplit does.
+	deadline := time.Now().Add(30 * time.Second)
+	for len(stackRec.recorded()) == 0 && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
 	}
-	if got := routeRec.recorded(); len(got) == 0 {
-		t.Fatal("the client never dialed through the injected route")
+	if got := stackRec.recorded(); len(got) == 0 {
+		t.Fatal("the client never dialed the exit through the engine stack")
 	}
-	if got := stackRec.recorded(); len(got) != 0 {
-		t.Fatalf("engine stack dialed although a route was injected: %v", got)
+	for _, d := range stackRec.recorded() {
+		if d != "tcp 127.0.0.1:1" {
+			t.Fatalf("unexpected data-path dial %q, want the exit address only", d)
+		}
+	}
+	if got := routeRec.recorded(); len(got) != 0 {
+		t.Fatalf("provider upstream carried exit dials: %v", got)
 	}
 
 	st := prov.Status()
 	if st.Details["engine_route"] != true {
 		t.Fatalf("Status engine_route = %v, want true", st.Details["engine_route"])
 	}
-	if st.Details["engine_stack"] != false {
-		t.Fatalf("Status engine_stack = %v, want false under a route", st.Details["engine_stack"])
+	if st.Details["engine_stack"] != true {
+		t.Fatalf("Status engine_stack = %v, want true (exit dials ride the stack)", st.Details["engine_stack"])
+	}
+}
+
+// TestNewProviderBrokerFetchRidesUpstream verifies the factory's control-plane
+// contract: with an injected engine route, the broker transport (the roster
+// fetch and the session manager's exit-route request) dials through the route,
+// while the stack recorder stays empty — no route ever arrives over the dead
+// pipe, so no exit dial can happen.
+func TestNewProviderBrokerFetchRidesUpstream(t *testing.T) {
+	routeRec, stackRec := &dialRecorder{}, &dialRecorder{}
+	p, err := NewProvider(map[string]any{
+		"outbound_id":         "geph-fetch",
+		"exit_constraint":     "auto",
+		"broker":              "https://broker.example",
+		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
+		pub.StackDialerKey:    fakeStackDialer{stackRec},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	prov := p.(*Provider)
+	defer prov.Close()
+
+	// The first roster fetch runs immediately after the client starts; poll
+	// for its dial on the route recorder.
+	deadline := time.Now().Add(10 * time.Second)
+	for len(routeRec.recorded()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	got := routeRec.recorded()
+	if len(got) == 0 {
+		t.Fatal("the broker fetch never dialed through the injected route")
+	}
+	for _, d := range got {
+		if d != "tcp broker.example:443" {
+			t.Fatalf("unexpected fetch dial %q, want the broker address only", d)
+		}
+	}
+	if got := stackRec.recorded(); len(got) != 0 {
+		t.Fatalf("engine stack dialed although a route was injected for fetches: %v", got)
+	}
+}
+
+// TestPinnedExitClientDialerSplit proves the dialer split for the lazily
+// started per-exit clients: a local fake broker serves a signed exit route
+// whose TCP hop is 127.0.0.1:1 (nothing answers). The pinned client's
+// get_exit_route fetch must ride brokerDialer — here a recording wrapper
+// around a real dialer so the fetch reaches the fake broker — while the
+// compiled route's exit dial rides stackDialer, never the fetch dialer.
+func TestPinnedExitClientDialerSplit(t *testing.T) {
+	masterPub, masterSec, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exitPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := brokerproto.NewJsonSigned(brokerproto.ExitRouteDescriptor{
+		ExitPubkey: exitPub,
+		Exit: brokerproto.ExitDescriptor{
+			C2EListen: "127.0.0.1:1",
+			B2EListen: "127.0.0.1:1",
+			Country:   "JP",
+			City:      "Tokyo",
+			Expiry:    uint64(time.Now().Add(time.Hour).Unix()),
+		},
+		Route: brokerproto.RouteDescriptor{Kind: "tcp", TcpAddr: "127.0.0.1:1"},
+	}, brokerproto.DomainExitRoute, masterSec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req nanorpc.JrpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp := nanorpc.JrpcResponse{JSONRPC: "2.0", ID: req.ID}
+		if req.Method == "get_exit_route" {
+			raw, _ := json.Marshal(signed)
+			resp.Result = raw
+		} else {
+			resp.Error = &nanorpc.JrpcError{Code: -32601, Message: "method not found", Data: json.RawMessage("null")}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	brokerRec, stackRec := &dialRecorder{}, &dialRecorder{}
+	p := &Provider{
+		cfg: providerConfig{
+			OutboundID: "geph-pinned-split",
+			Broker:     json.RawMessage(`"` + srv.URL + `"`),
+			BrokerKeys: json.RawMessage(`{"master":"` + hex.EncodeToString(masterPub) + `"}`),
+		},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+		// The fetch dialer records and then really dials, so the RPC reaches
+		// the fake broker; the data-path dialer only records (nothing answers
+		// at the route's address anyway).
+		brokerDialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+			brokerRec.record(network, address)
+			var d net.Dialer
+			return d.DialContext(ctx, network, address)
+		},
+		stackDialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+			stackRec.record(network, address)
+			return nil, errors.New("fake stack dial: nothing answers")
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	client, err := p.startExitClient(ctx, "pin.example")
+	if err != nil {
+		t.Fatalf("startExitClient: %v", err)
+	}
+	defer client.Close()
+
+	// The first get_exit_route waits out the connect-token window (~10s —
+	// no credential ever refreshes), then the compiled route dials the exit
+	// through the stack dialer and keeps retrying.
+	deadline := time.Now().Add(45 * time.Second)
+	for len(stackRec.recorded()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if len(stackRec.recorded()) == 0 {
+		t.Fatal("pinned client never dialed the exit through the stack dialer")
+	}
+	for _, d := range stackRec.recorded() {
+		if d != "tcp 127.0.0.1:1" {
+			t.Fatalf("unexpected data-path dial %q, want the exit address only", d)
+		}
+	}
+	brokerDials := brokerRec.recorded()
+	if len(brokerDials) == 0 {
+		t.Fatal("pinned client's broker fetch did not ride brokerDialer")
+	}
+	brokerAddr := strings.TrimPrefix(srv.URL, "http://")
+	for _, d := range brokerDials {
+		if d != "tcp "+brokerAddr {
+			t.Fatalf("unexpected fetch dial %q, want the broker address only", d)
+		}
 	}
 }

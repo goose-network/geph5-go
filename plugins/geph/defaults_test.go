@@ -165,7 +165,7 @@ func TestOutboundsEmitRosterWhileConnecting(t *testing.T) {
 			t.Fatalf("outbound %q is not a per-exit pin (general outbound leaked while connecting)", o.ID)
 		}
 	}
-	if out[0].ID != "geph-list-berlin1.example" || out[1].ID != "geph-list-tokyo1.example" {
+	if out[0].ID != "geph-list-berlin1.example-5.6.7.8:7001" || out[1].ID != "geph-list-tokyo1.example-1.2.3.4:7000" {
 		t.Fatalf("per-exit outbounds not sorted: %q, %q", out[0].ID, out[1].ID)
 	}
 }
