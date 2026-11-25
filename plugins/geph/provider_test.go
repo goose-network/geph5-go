@@ -282,8 +282,12 @@ func TestOutboundFactory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("factory (defaults): %v", err)
 	}
-	if ob.ID() != "geph" || ob.Address() != "geph://geph" {
-		t.Fatalf("default outbound = %s %s", ob.ID(), ob.Address())
+	// The aggregate (auto) outbound has no socket address: it reports "" so the
+	// engine's dial-reachability sweep skips it. A pseudo-URI is not a dialable
+	// host:port and would latch a permanent unreachable verdict, dropping geph's
+	// sole auto route — see outbound.Address.
+	if ob.ID() != "geph" || ob.Address() != "" {
+		t.Fatalf("default outbound = %s %q", ob.ID(), ob.Address())
 	}
 }
 
@@ -1158,6 +1162,13 @@ func TestPinnedExitClientDialerSplit(t *testing.T) {
 			stackRec.record(network, address)
 			return nil, errors.New("fake stack dial: nothing answers")
 		},
+		// The per-exit pin is a client-side "direct" (c2e/pubkey) constraint, so
+		// the roster must carry the exit's c2e address and pubkey to pin.
+		exits: []exitInfo{{
+			Hostname:  "pin.example",
+			PubkeyHex: hex.EncodeToString(masterPub),
+			C2EListen: "127.0.0.1:1",
+		}},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1168,9 +1179,9 @@ func TestPinnedExitClientDialerSplit(t *testing.T) {
 	}
 	defer client.Close()
 
-	// The first get_exit_route waits out the connect-token window (~10s —
-	// no credential ever refreshes), then the compiled route dials the exit
-	// through the stack dialer and keeps retrying.
+	// The direct constraint compiles a route client-side (no get_exit_route):
+	// it dials the exit's c2e through the stack dialer immediately, while the
+	// auth loop's broker RPCs ride brokerDialer.
 	deadline := time.Now().Add(45 * time.Second)
 	for len(stackRec.recorded()) == 0 && time.Now().Before(deadline) {
 		time.Sleep(200 * time.Millisecond)

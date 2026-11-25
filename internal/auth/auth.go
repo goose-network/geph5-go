@@ -60,6 +60,19 @@ type Manager struct {
 
 	// authTokenMu serializes get_auth_token to avoid redundant broker calls.
 	authTokenMu sync.Mutex
+
+	// level mirrors the process-global ISPlus but is scoped to THIS manager (one
+	// client's credential). Embedders that co-host several independent clients —
+	// goose runs one per provider spec — read AccountLevel to gate exits by their
+	// OWN account's tier instead of the shared global that every client's auth
+	// loop overwrites. It packs (known, isPlus) into a SINGLE atomic word — bit0
+	// = tier determined, bit1 = Plus — so a reader always observes a consistent
+	// pair. Two separate atomics read data-then-flag can be torn (old isPlus +
+	// new known=true) across a Free<->Plus transition, misclassifying a Plus
+	// account as Free at the exit gate; one word makes the snapshot atomic. known
+	// stays 0 until the first refresh/token fetch determines the tier, so a cold
+	// client does not misclassify a Plus account as Free during warmup.
+	level atomic.Uint32
 }
 
 // NewManager constructs a Manager. broker may be nil (in which case auth_loop
@@ -77,6 +90,28 @@ func NewManager(cfg *config.Config, db *database.Database, broker *brokerproto.B
 // Rust ACCOUNT_STATUS_CHECKED.set().
 func (m *Manager) markAccountStatusChecked() {
 	m.accountStatusOnce.Do(func() { close(m.accountStatusChecked) })
+}
+
+// AccountLevel reports this client's own account tier and whether it has been
+// determined yet (known is false until the first refreshConnToken/GetConnectToken
+// lands). Unlike the process-global ISPlus — written by every client in the
+// process — this is per-manager, so independent providers with different
+// credentials each observe their own tier rather than whichever client wrote the
+// global last.
+func (m *Manager) AccountLevel() (isPlus bool, known bool) {
+	v := m.level.Load()
+	return v&2 != 0, v&1 != 0
+}
+
+// setLevel records this client's determined tier as a SINGLE atomic store, so
+// AccountLevel never reads a torn (isPlus, known) pair. known is always set:
+// callers invoke this only once a token/refresh has determined the tier.
+func (m *Manager) setLevel(isPlus bool) {
+	var v uint32 = 1 // bit0: known
+	if isPlus {
+		v |= 2 // bit1: Plus
+	}
+	m.level.Store(v)
 }
 
 // ConnectToken is the decoded (level, token, sig) tuple stored under
@@ -169,7 +204,9 @@ func (m *Manager) GetConnectToken(ctx context.Context) (*ConnectToken, error) {
 	if err != nil {
 		return nil, err
 	}
-	ISPlus.Store(ct.Level == brokerproto.AccountLevelPlus)
+	isPlus := ct.Level == brokerproto.AccountLevelPlus
+	ISPlus.Store(isPlus)
+	m.setLevel(isPlus)
 	return ct, nil
 }
 
@@ -207,6 +244,11 @@ func (m *Manager) GetAuthToken(ctx context.Context) (string, error) {
 	if m.Broker == nil {
 		return "", errors.New("auth: no broker configured to fetch auth token")
 	}
+	// Ensure a broker-acceptable credential, self-registering via proof-of-work
+	// if none is configured (the production broker rejects test_dummy).
+	if err := m.ensureCredential(ctx); err != nil {
+		return "", err
+	}
 	log.Printf("auth: obtaining auth token from broker")
 	credJSON, err := m.marshalCredential()
 	if err != nil {
@@ -240,9 +282,21 @@ func (m *Manager) AuthLoop(ctx context.Context) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	authToken, err := m.GetAuthToken(ctx)
-	if err != nil {
-		return fmt.Errorf("auth: get auth token: %w", err)
+	// Retry get_auth_token rather than dying on the first error: a transient
+	// broker failure (or the one-time registration PoW) must not permanently
+	// zombify auth while session workers keep retrying. The Rust client is
+	// supervised/restarted by the geph manager; here the loop self-heals.
+	var authToken string
+	for {
+		var err error
+		authToken, err = m.GetAuthToken(ctx)
+		if err == nil {
+			break
+		}
+		log.Printf("auth: get auth token failed (retrying in 10s): %v", err)
+		if serr := sleepCtx(ctx, 10*time.Second); serr != nil {
+			return serr
+		}
 	}
 	for {
 		if ctx.Err() != nil {
@@ -285,6 +339,7 @@ func (m *Manager) refreshConnToken(ctx context.Context, authToken string) error 
 	now := uint64(time.Now().Unix())
 	isPlus := plusExpiry > now
 	ISPlus.Store(isPlus)
+	m.setLevel(isPlus)
 	log.Printf("auth: got latest plus expiry=%d (isPlus=%v)", plusExpiry, isPlus)
 
 	// currently_plus: check the cached current-epoch token's level.
@@ -422,14 +477,24 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 // isWrongLevelErr reports whether err is the broker's WrongLevel auth error.
-// nanorpc surfaces it as a *nanorpc.ServerError whose message is "wrong_level".
+// nanorpc-derive maps a method's Err(AuthError) arm to ServerError{message:
+// e.to_string(), details: to_value(e)}: the message is the thiserror Display
+// ("wrong level", with a space) while the structured serde tag ("wrong_level")
+// lands in the JSON-RPC error's data field. Check Data first; fall back to the
+// message for robustness.
 func isWrongLevelErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	var se *nanorpc.ServerError
 	if errors.As(err, &se) {
-		return se.Message == "wrong_level"
+		if len(se.Data) > 0 {
+			var ae brokerproto.AuthError
+			if json.Unmarshal(se.Data, &ae) == nil && ae == brokerproto.AuthErrWrongLevel {
+				return true
+			}
+		}
+		return se.Message == "wrong_level" || se.Message == "wrong level"
 	}
 	return false
 }

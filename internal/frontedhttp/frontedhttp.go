@@ -88,7 +88,11 @@ func (t *Transport) CallRaw(ctx context.Context, req *nanorpc.JrpcRequest) (*nan
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if t.Host != "" {
-		httpReq.Header.Set("Host", t.Host)
+		// net/http takes the request Host from req.Host (falling back to the
+		// URL host) and IGNORES a "Host" entry in the Header map, so domain
+		// fronting requires setting req.Host directly. SNI still follows the
+		// front URL host automatically.
+		httpReq.Host = t.Host
 		httpReq.Header.Set("X-Padding", randomPadding())
 	}
 	// Ensure TLS SNI uses the front URL's host. Go's default TLS client sets

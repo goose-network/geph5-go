@@ -163,14 +163,103 @@ type clientConn interface {
 }
 
 // exitInfo is one broker-known exit, in the form the provider emits and the
-// web UI shows. The hostname is the constraint a per-exit dial pins; C2EListen
-// is the exit's client-facing host:port, appended to the per-exit outbound id.
+// web UI shows. Hostname (the roster's pubkey-hex key) identifies the exit a
+// per-exit dial pins via its c2e/pubkey "direct" constraint; C2EListen is the
+// exit's client-facing host:port, appended to the per-exit outbound id.
+// AllowedLevels is the exit's access policy from the broker roster ("Free",
+// "Plus"): a free account can only tunnel through exits that admit "Free", so
+// the provider advertises and dials per-exit outbounds accordingly. Empty means
+// the roster carried no policy (legacy/unknown) — treated as usable.
 type exitInfo struct {
-	Hostname  string
-	PubkeyHex string
-	C2EListen string
-	Country   string
-	City      string
+	Hostname      string
+	PubkeyHex     string
+	C2EListen     string
+	Country       string
+	City          string
+	AllowedLevels []string
+}
+
+// exitUsable reports whether an exit admits the account's current level. An
+// exit with no advertised levels (unknown/legacy roster) is always usable, so
+// missing metadata never silently narrows discovery. A free account (isPlus
+// false) needs "Free" among the levels; a Plus account needs "Plus".
+func exitUsable(levels []string, isPlus bool) bool {
+	if len(levels) == 0 {
+		return true
+	}
+	want := "Free"
+	if isPlus {
+		want = "Plus"
+	}
+	for _, l := range levels {
+		if l == want {
+			return true
+		}
+	}
+	return false
+}
+
+// accountLevelName renders the account tier for diagnostics.
+func accountLevelName(isPlus bool) string {
+	if isPlus {
+		return "Plus"
+	}
+	return "Free"
+}
+
+// accountLeveler is the optional capability a clientConn exposes when it can
+// report its own account tier (the real *clientlib.Client does; test fakes need
+// not). Reading the per-client tier — rather than the process-global
+// auth.ISPlus that every embedded client overwrites — keeps each provider's
+// exit-eligibility gate tied to its OWN credential.
+type accountLeveler interface {
+	AccountLevel() (isPlus bool, known bool)
+}
+
+// accountLevel reads THIS provider's primary client's own account tier. known
+// is false when there is no client yet or its first auth has not completed;
+// callers must not gate on tier then, or a cold Plus account would be misread as
+// Free. All of a provider's clients share its credential, so the primary's tier
+// represents the per-exit clients too.
+func (p *Provider) accountLevel() (isPlus bool, known bool) {
+	p.mu.Lock()
+	c := p.client
+	p.mu.Unlock()
+	if al, ok := c.(accountLeveler); ok {
+		return al.AccountLevel()
+	}
+	return false, false
+}
+
+// checkExitTier returns an actionable error when THIS provider's account cannot
+// tunnel through an exit advertising the given levels. It gates on the
+// per-client tier (not the process-global auth.ISPlus, which other providers
+// overwrite) and only once the tier is known — during warmup a cold Plus account
+// must not be misread as Free, so an unknown tier never rejects. The message
+// names the exit's actual allowed levels and the account's actual tier, so it is
+// correct for any mismatch (a Plus account on a Free-only exit included).
+func (p *Provider) checkExitTier(hostname string, levels []string) error {
+	isPlus, known := p.accountLevel()
+	if known && !exitUsable(levels, isPlus) {
+		return fmt.Errorf("geph provider: exit %s admits levels %v; this account is %s", hostname, levels, accountLevelName(isPlus))
+	}
+	return nil
+}
+
+// exitLevels returns the advertised allowed levels for a roster exit, or nil
+// when the hostname is not in the current roster (exitUsable treats nil as
+// unrestricted, so an unknown exit passes the tier gate and then fails the
+// roster lookup in startExitClient). Read under p.mu; getOrStartExitClient uses
+// it to re-check tier on every dial, not only when a per-exit client boots.
+func (p *Provider) exitLevels(hostname string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.exits {
+		if e.Hostname == hostname {
+			return e.AllowedLevels
+		}
+	}
+	return nil
 }
 
 // exitIdleClose bounds how long a lazily-started per-exit client with no
@@ -221,6 +310,13 @@ type Provider struct {
 	// stop cancels the client; stopped is closed when the run goroutine exits.
 	stop    context.CancelFunc
 	stopped chan struct{}
+	// runCtx is the provider's own background lifetime (canceled by stop). Per-exit
+	// clients derive their lifetime from it, NOT from the dial request context: a
+	// request ctx is canceled when its inbound handler returns, which would kill a
+	// cached per-exit client's auth loop and sessions after the first request and
+	// leave a dead-but-cached client that is never restarted. Set once at
+	// construction before the provider is registered, so reads need no lock.
+	runCtx context.Context
 
 	// pinnedDialer starts per-exit clients lazily; swapped for a fake in tests.
 	pinnedDialer func(ctx context.Context, hostname string) (clientConn, error)
@@ -377,6 +473,7 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	p.pinnedDialer = p.startExitClient
 	ctx, cancel := context.WithCancel(context.Background())
 	p.stop = cancel
+	p.runCtx = ctx
 	go func() {
 		defer close(p.stopped)
 		p.run(ctx)
@@ -412,43 +509,10 @@ const exitStartRetry = 30 * time.Second
 // start is retried after exitStartRetry; idle clients are reaped on the next
 // Outbounds poll.
 func (p *Provider) dialExit(ctx context.Context, hostname, remote string) (net.Conn, error) {
-	p.mu.Lock()
-	st, ok := p.exitClients[hostname]
-	if !ok {
-		st = &exitClientState{}
-		if p.exitClients == nil {
-			p.exitClients = map[string]*exitClientState{}
-		}
-		p.exitClients[hostname] = st
+	client, err := p.getOrStartExitClient(ctx, hostname)
+	if err != nil {
+		return nil, err
 	}
-	p.mu.Unlock()
-
-	st.mu.Lock()
-	if st.client == nil && (st.startErr == nil || time.Since(st.startAt) > exitStartRetry) {
-		// Start under the state lock so a concurrent dial to the same exit
-		// cannot race a second client into existence.
-		client, err := p.pinnedDialer(ctx, hostname)
-		st.startAt = time.Now()
-		if err != nil {
-			st.startErr = err
-			st.mu.Unlock()
-			return nil, fmt.Errorf("geph provider: start client for exit %s: %w", hostname, err)
-		}
-		st.startErr = nil
-		st.client = client
-		log.Printf("geph provider: per-exit client for %s started", hostname)
-	}
-	st.lastUse = time.Now()
-	client := st.client
-	startErr := st.startErr
-	st.mu.Unlock()
-
-	if client == nil {
-		// The cached failure is retried by a later dial (see the window
-		// above); this dial only reports it.
-		return nil, fmt.Errorf("geph provider: exit %s unavailable (recent start failed, retrying later): %w", hostname, startErr)
-	}
-
 	// Wait for the pinned client's first session before handing the dial
 	// over — an OpenConn with no session would fail anyway, but this bounds
 	// the wait and surfaces "still establishing" instead of a tunnel error.
@@ -458,6 +522,110 @@ func (p *Provider) dialExit(ctx context.Context, hostname, remote string) (net.C
 		return nil, fmt.Errorf("geph provider: exit %s: %w", hostname, err)
 	}
 	return client.OpenConn(ctx, remote)
+}
+
+// chainClient is the optional chaining capability of a per-exit client: dialing
+// a target over an existing upstream transport conn (the goose ChainDialer
+// path). *clientlib.Client implements it; the test fakes (which only model
+// OpenConn) do not, so the provider type-asserts rather than widening clientConn.
+type chainClient interface {
+	DialThrough(ctx context.Context, via net.Conn, remote string) (net.Conn, error)
+}
+
+// dialExitThrough is the chained form of dialExit: the previous hop has already
+// tunneled to the pinned exit's c2e listener (via), and geph establishes a
+// one-off session over that tunnel instead of dialing the exit from the local
+// network. It reuses the same lazily-started per-exit client as dialExit (for
+// its auth manager and direct constraint) but does NOT wait for a background
+// session — DialThrough establishes its own session synchronously over via.
+//
+// via ownership follows the router's ChainDialer contract: on success the
+// returned conn owns via; on error the router closes via (and DialThrough closes
+// it too once handed off — a benign double close).
+func (p *Provider) dialExitThrough(ctx context.Context, hostname, remote string, via net.Conn) (net.Conn, error) {
+	client, err := p.getOrStartExitClient(ctx, hostname)
+	if err != nil {
+		return nil, err
+	}
+	cc, ok := client.(chainClient)
+	if !ok {
+		return nil, fmt.Errorf("geph provider: exit %s client does not support chaining", hostname)
+	}
+	return cc.DialThrough(ctx, via, remote)
+}
+
+// getOrStartExitClient returns the lazily-started per-exit client for hostname,
+// booting it on first use (shared by every dial to that exit — a full session
+// stack is too heavy to boot per connection). The state lock serializes the
+// start so concurrent dials cannot race a second client into existence; a failed
+// start is cached and retried after exitStartRetry. Both dialExit (background
+// session) and dialExitThrough (one-off chained session) use it.
+func (p *Provider) getOrStartExitClient(ctx context.Context, hostname string) (clientConn, error) {
+	for {
+		p.mu.Lock()
+		st, ok := p.exitClients[hostname]
+		if !ok {
+			st = &exitClientState{}
+			if p.exitClients == nil {
+				p.exitClients = map[string]*exitClientState{}
+			}
+			p.exitClients[hostname] = st
+		}
+		p.mu.Unlock()
+
+		st.mu.Lock()
+		// Re-validate this state is still the mapped one: the idle reaper may have
+		// removed it (and closed/nil'd its client) between the map lookup above and
+		// this lock. If so, drop it and loop to get-or-create a fresh state rather
+		// than starting a client into an orphaned state no future dial will find.
+		// st.mu -> p.mu, the same order startExitClient and the reaper use, so this
+		// adds no lock inversion.
+		p.mu.Lock()
+		cur, mapped := p.exitClients[hostname]
+		p.mu.Unlock()
+		if !mapped || cur != st {
+			st.mu.Unlock()
+			continue
+		}
+		// Re-gate tier on EVERY dial, not only at boot. A per-exit client booted
+		// during warmup (account tier still unknown) for an exit this account
+		// cannot use would otherwise be cached and returned forever, latching the
+		// warmup skip into opaque auth-EOF failures even after the tier becomes
+		// known. Gating here — before the boot/cache path and before lastUse is
+		// refreshed — surfaces the actionable tier error and lets a doomed client
+		// idle-reap rather than be kept alive by rejected traffic. checkExitTier
+		// and exitLevels lock p.mu under st.mu (st.mu -> p.mu), the order used
+		// throughout this path, so this adds no lock inversion.
+		if err := p.checkExitTier(hostname, p.exitLevels(hostname)); err != nil {
+			st.mu.Unlock()
+			return nil, err
+		}
+		if st.client == nil && (st.startErr == nil || time.Since(st.startAt) > exitStartRetry) {
+			// Start under the state lock so a concurrent dial to the same exit
+			// cannot race a second client into existence.
+			client, err := p.pinnedDialer(ctx, hostname)
+			st.startAt = time.Now()
+			if err != nil {
+				st.startErr = err
+				st.mu.Unlock()
+				return nil, fmt.Errorf("geph provider: start client for exit %s: %w", hostname, err)
+			}
+			st.startErr = nil
+			st.client = client
+			log.Printf("geph provider: per-exit client for %s started", hostname)
+		}
+		st.lastUse = time.Now()
+		client := st.client
+		startErr := st.startErr
+		st.mu.Unlock()
+
+		if client == nil {
+			// The cached failure is retried by a later dial (see the window
+			// above); this dial only reports it.
+			return nil, fmt.Errorf("geph provider: exit %s unavailable (recent start failed, retrying later): %w", hostname, startErr)
+		}
+		return client, nil
+	}
 }
 
 // awaitExitSession polls until the client reports a live session or ctx ends.
@@ -476,18 +644,59 @@ func (p *Provider) awaitExitSession(ctx context.Context, client clientConn) erro
 	}
 }
 
-// startExitClient boots a full embedded geph5 client whose exit constraint is
-// pinned to hostname. It is the production pinnedDialer; tests swap it. The
-// client's context is canceled by Close, so pinned clients stop with the
-// provider. Like the primary client, its broker fetches ride brokerDialer
-// (the provider upstream when injected) and its exit dials ride stackDialer.
-func (p *Provider) startExitClient(ctx context.Context, hostname string) (clientConn, error) {
+// startExitClient boots a full embedded geph5 client pinned to one roster exit
+// via a client-side "direct" (c2e/pubkey) constraint. It is the production
+// pinnedDialer; tests swap it. The client's lifetime is the provider's background
+// context (runCtx), canceled by Close — NOT the dial request ctx, which the
+// inbound cancels when its handler returns and would otherwise kill the cached
+// client's auth loop and sessions after the first request. Like the primary
+// client, its broker fetches ride brokerDialer (the provider upstream when
+// injected) and its exit dials ride stackDialer.
+func (p *Provider) startExitClient(_ context.Context, hostname string) (clientConn, error) {
 	clientCfg, err := buildClientConfig(p.cfg)
 	if err != nil {
 		return nil, err
 	}
-	clientCfg.ExitConstraint = brokerproto.ExitConstraint{Kind: "hostname", Hostname: hostname}
-	cancelCtx, cancel := context.WithCancel(ctx)
+	// Pin the specific exit with a client-side "direct" constraint
+	// ("c2e/pubkeyhex"). The broker resolves neither a hostname constraint
+	// carrying the roster's pubkey-hex key ("no exits match the constraints")
+	// nor a direct constraint sent over RPC ("direct constraints must not be
+	// sent to the broker"); GetDialer handles "direct" locally (getDialerDirect),
+	// dialing the exit's c2e through the stack dialer — which, in a chain, rides
+	// the upstream tunnel. Look up the c2e/pubkey from the current roster.
+	p.mu.Lock()
+	var c2e, pubkey string
+	var levels []string
+	for _, e := range p.exits {
+		if e.Hostname == hostname {
+			c2e, pubkey = e.C2EListen, e.PubkeyHex
+			levels = e.AllowedLevels
+			break
+		}
+	}
+	p.mu.Unlock()
+	if c2e == "" || pubkey == "" {
+		return nil, fmt.Errorf("geph provider: exit %s not in current roster (no c2e/pubkey to pin)", hostname)
+	}
+	// Fail fast with an actionable reason when THIS provider's account cannot use
+	// the exit, rather than booting a client whose auth handshake the exit will
+	// silently close (a Plus-only exit rejects a Free credential mid-hello). A
+	// chain pinned to such an exit gets this clear error instead of an opaque
+	// "read exit hello: EOF".
+	if err := p.checkExitTier(hostname, levels); err != nil {
+		return nil, err
+	}
+	clientCfg.ExitConstraint = brokerproto.ExitConstraint{Kind: "direct", Direct: c2e + "/" + pubkey}
+	// Lifetime = the provider's background context, not the dial request ctx (see
+	// the method comment): the cached client must outlive the first request.
+	// Providers constructed directly in tests carry no runCtx; fall back to
+	// Background there (the test closes the client explicitly). NewProvider always
+	// sets runCtx, so production clients are canceled with the provider.
+	parent := p.runCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	cancelCtx, cancel := context.WithCancel(parent)
 	p.mu.Lock()
 	p.exitCancels = append(p.exitCancels, cancel)
 	p.mu.Unlock()
@@ -509,22 +718,44 @@ func (p *Provider) startExitClient(ctx context.Context, hostname string) (client
 // dedicated reaper goroutine; each reaped client's Close stops its session
 // manager, and its exitCancels entry fires with the provider.
 func (p *Provider) reapExitClients() {
+	// Snapshot the states under p.mu, then release it. The reaper locks each
+	// st.mu BEFORE p.mu (st.mu -> p.mu) — the SAME order the start path uses
+	// (getOrStartExitClient holds st.mu across startExitClient, which locks p.mu
+	// for the roster lookup and exitCancels append). The previous version held
+	// p.mu while locking st.mu (p.mu -> st.mu), closing an ABBA cycle with the
+	// start path that could permanently wedge the provider (every later p.mu
+	// user — Status, Outbounds, dialConn, even Close — would block).
 	p.mu.Lock()
-	var reaped []*exitClientState
+	type candidate struct {
+		hostname string
+		st       *exitClientState
+	}
+	cands := make([]candidate, 0, len(p.exitClients))
 	for hostname, st := range p.exitClients {
-		st.mu.Lock()
-		client := st.client
-		idle := !st.lastUse.IsZero() && time.Since(st.lastUse) > exitIdleClose
-		st.mu.Unlock()
-		if !idle || client == nil {
-			continue
-		}
-		delete(p.exitClients, hostname)
-		reaped = append(reaped, st)
+		cands = append(cands, candidate{hostname, st})
 	}
 	p.mu.Unlock()
-	for _, st := range reaped {
-		st.client.Close()
+
+	var reaped []clientConn
+	for _, c := range cands {
+		c.st.mu.Lock()
+		idle := !c.st.lastUse.IsZero() && time.Since(c.st.lastUse) > exitIdleClose
+		client := c.st.client
+		if idle && client != nil {
+			p.mu.Lock()
+			// Re-check the map still holds this exact state: a concurrent Close or
+			// restart may have replaced/removed it since the snapshot.
+			if cur, ok := p.exitClients[c.hostname]; ok && cur == c.st {
+				delete(p.exitClients, c.hostname)
+				c.st.client = nil
+				reaped = append(reaped, client)
+			}
+			p.mu.Unlock()
+		}
+		c.st.mu.Unlock()
+	}
+	for _, client := range reaped {
+		client.Close()
 		log.Printf("geph provider: reaped idle per-exit client")
 	}
 }
@@ -817,12 +1048,17 @@ func (p *Provider) refreshExitsOnce(ctx context.Context, client *clientlib.Clien
 	}
 	exits := make([]exitInfo, 0, len(status.Exits))
 	for hostname, entry := range status.Exits {
+		levels := make([]string, len(entry.Metadata.AllowedLevels))
+		for i, l := range entry.Metadata.AllowedLevels {
+			levels[i] = string(l)
+		}
 		exits = append(exits, exitInfo{
-			Hostname:  hostname,
-			PubkeyHex: entry.PubkeyHex(),
-			C2EListen: entry.Exit.C2EListen,
-			Country:   entry.Exit.Country,
-			City:      entry.Exit.City,
+			Hostname:      hostname,
+			PubkeyHex:     entry.PubkeyHex(),
+			C2EListen:     entry.Exit.C2EListen,
+			Country:       entry.Exit.Country,
+			City:          entry.Exit.City,
+			AllowedLevels: levels,
 		})
 	}
 	sort.Slice(exits, func(i, j int) bool { return exits[i].Hostname < exits[j].Hostname })
@@ -942,6 +1178,24 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 			},
 		})
 	}
+	// Advertise every discovered exit, regardless of the account's tier. The
+	// roster is a stable discovery surface: removing an exit here would make the
+	// engine delete its outbound id, and a chain pinned to that id would silently
+	// drop the hop (the router skips unknown references) and exit via the upstream
+	// proxy instead — a silent exit-path override in a circumvention tool. Tier
+	// eligibility is enforced per-dial by getOrStartExitClient, which fails loudly
+	// with an actionable error when the account cannot use the exit.
+	//
+	// Each per-exit outbound is marked pin_only (the goose reserved config key):
+	// it exists to be PINNED by an explicit chain/pool reference, not auto-selected.
+	// The engine excludes pin_only outbounds from provider-managed pool membership
+	// and the implicit all-outbounds fallback, so a Free account's default
+	// pool/fallback never round-robins onto a Plus-only exit it cannot use (which
+	// would fail the majority of requests with no retry or self-healing). The
+	// aggregate "geph" outbound above is the auto-selectable route: it rides the
+	// primary client's session pool, which only holds live (tier-usable) sessions.
+	// allowed_levels rides in Config so the UI can show which exits the current
+	// account may tunnel through.
 	seen := map[string]int{}
 	for _, e := range exits {
 		// Append the exit's c2e address so the id carries the proxy server's
@@ -963,12 +1217,14 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 			ID:       exitID,
 			Protocol: "geph",
 			Config: map[string]any{
-				"id":            exitID,
-				"tunnel":        id,
-				"exit_hostname": e.Hostname,
-				"address":       e.C2EListen,
-				"country":       e.Country,
-				"city":          e.City,
+				"id":             exitID,
+				"tunnel":         id,
+				"exit_hostname":  e.Hostname,
+				"address":        e.C2EListen,
+				"country":        e.Country,
+				"city":           e.City,
+				"allowed_levels": e.AllowedLevels,
+				"pin_only":       true,
 			},
 		})
 	}

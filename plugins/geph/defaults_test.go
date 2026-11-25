@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -167,5 +168,176 @@ func TestOutboundsEmitRosterWhileConnecting(t *testing.T) {
 	}
 	if out[0].ID != "geph-list-berlin1.example-5.6.7.8:7001" || out[1].ID != "geph-list-tokyo1.example-1.2.3.4:7000" {
 		t.Fatalf("per-exit outbounds not sorted: %q, %q", out[0].ID, out[1].ID)
+	}
+}
+
+// TestExitUsable checks the freemium access predicate: a free account needs
+// "Free" among an exit's advertised levels, a Plus account needs "Plus", and an
+// exit with no advertised policy is always usable (missing metadata must not
+// silently narrow discovery).
+func TestExitUsable(t *testing.T) {
+	cases := []struct {
+		levels []string
+		isPlus bool
+		want   bool
+	}{
+		{[]string{"Plus", "Free"}, false, true},
+		{[]string{"Plus", "Free"}, true, true},
+		{[]string{"Plus"}, false, false},
+		{[]string{"Plus"}, true, true},
+		{[]string{"Free"}, false, true},
+		{[]string{"Free"}, true, false},
+		{nil, false, true},
+		{[]string{}, true, true},
+	}
+	for _, c := range cases {
+		if got := exitUsable(c.levels, c.isPlus); got != c.want {
+			t.Errorf("exitUsable(%v, isPlus=%v) = %v, want %v", c.levels, c.isPlus, got, c.want)
+		}
+	}
+}
+
+// levelClient is a clientConn that also reports a configurable account tier, so
+// tests can exercise the per-provider exit-eligibility gate without a live
+// client. Embedding fakeClient supplies the dial/session/close surface; the gate
+// never dials, so onDial may be nil.
+type levelClient struct {
+	fakeClient
+	isPlus bool
+	known  bool
+}
+
+func (c *levelClient) AccountLevel() (bool, bool) { return c.isPlus, c.known }
+
+// TestOutboundsAdvertisesAllExitsWithLevels verifies the advertised roster is a
+// stable discovery surface: every discovered exit is listed regardless of the
+// account's tier, with its allowed_levels carried in Config. Filtering exits out
+// of Outbounds would make the engine delete their outbound ids and silently
+// truncate any chain pinned to them (the router skips unknown references), so
+// eligibility is enforced at the dial gate instead — see TestCheckExitTier.
+func TestOutboundsAdvertisesAllExitsWithLevels(t *testing.T) {
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "geph"},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+	}
+	p.mu.Lock()
+	p.ready = false
+	p.exits = []exitInfo{
+		{Hostname: "free1", C2EListen: "1.1.1.1:1", AllowedLevels: []string{"Plus", "Free"}},
+		{Hostname: "plus1", C2EListen: "2.2.2.2:2", AllowedLevels: []string{"Plus"}},
+		{Hostname: "unknown1", C2EListen: "3.3.3.3:3"},
+	}
+	p.mu.Unlock()
+
+	out, err := p.Outbounds(context.Background())
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("got %d outbounds, want 3 (all exits advertised, none filtered)", len(out))
+	}
+	levels := map[string][]string{}
+	for _, o := range out {
+		h := o.Config["exit_hostname"].(string)
+		if al, ok := o.Config["allowed_levels"].([]string); ok {
+			levels[h] = al
+		}
+	}
+	if len(levels["plus1"]) != 1 || levels["plus1"][0] != "Plus" {
+		t.Fatalf("plus1 allowed_levels = %v, want [Plus]", levels["plus1"])
+	}
+	if len(levels["free1"]) != 2 {
+		t.Fatalf("free1 allowed_levels = %v, want [Plus Free]", levels["free1"])
+	}
+}
+
+// TestAccountLevelReadsProviderClient verifies the provider reads its OWN
+// client's tier: a nil client or a clientConn without the AccountLevel capability
+// reports unknown, and a client that reports a tier is read verbatim.
+func TestAccountLevelReadsProviderClient(t *testing.T) {
+	p := &Provider{watchCh: make(chan struct{}, 1), stopped: make(chan struct{})}
+	if isPlus, known := p.accountLevel(); isPlus || known {
+		t.Fatalf("nil client: got (%v,%v), want (false,false)", isPlus, known)
+	}
+	p.client = &fakeClient{} // no AccountLevel capability
+	if _, known := p.accountLevel(); known {
+		t.Fatal("fakeClient (no AccountLevel): want unknown")
+	}
+	p.client = &levelClient{isPlus: true, known: true}
+	if isPlus, known := p.accountLevel(); !isPlus || !known {
+		t.Fatalf("levelClient: got (%v,%v), want (true,true)", isPlus, known)
+	}
+}
+
+// TestCheckExitTier walks the dial-gate decision: a known tier rejects an exit
+// whose allowed levels exclude it, an unknown tier (warmup) never rejects, and
+// empty levels are always usable.
+func TestCheckExitTier(t *testing.T) {
+	cases := []struct {
+		name    string
+		isPlus  bool
+		known   bool
+		levels  []string
+		wantErr bool
+	}{
+		{"free_plus_only_rejected", false, true, []string{"Plus"}, true},
+		{"free_free_admitting_ok", false, true, []string{"Plus", "Free"}, false},
+		{"plus_plus_only_ok", true, true, []string{"Plus"}, false},
+		{"plus_free_only_rejected", true, true, []string{"Free"}, true},
+		{"warmup_free_never_rejects", false, false, []string{"Plus"}, false},
+		{"warmup_plus_never_rejects", true, false, []string{"Free"}, false},
+		{"empty_levels_always_ok", false, true, nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := &Provider{watchCh: make(chan struct{}, 1), stopped: make(chan struct{})}
+			p.client = &levelClient{isPlus: c.isPlus, known: c.known}
+			err := p.checkExitTier("x", c.levels)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("checkExitTier(%v, isPlus=%v, known=%v) err=%v, wantErr=%v", c.levels, c.isPlus, c.known, err, c.wantErr)
+			}
+		})
+	}
+}
+
+// TestCheckExitTierMessageAccurate verifies the diagnostic names the exit's
+// actual allowed levels and the account's actual tier — correct even for a Plus
+// account on a Free-only exit (the old hardcoded "account is Free" was doubly
+// false there).
+func TestCheckExitTierMessageAccurate(t *testing.T) {
+	p := &Provider{watchCh: make(chan struct{}, 1), stopped: make(chan struct{})}
+	p.client = &levelClient{isPlus: true, known: true}
+	err := p.checkExitTier("freeonly", []string{"Free"})
+	if err == nil {
+		t.Fatal("expected rejection for a Plus account on a Free-only exit")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "this account is Plus") || !strings.Contains(msg, "[Free]") {
+		t.Fatalf("message misdescribes the mismatch: %q", msg)
+	}
+	if strings.Contains(msg, "account is Free") {
+		t.Fatalf("message falsely claims the account is Free: %q", msg)
+	}
+}
+
+// TestCheckExitTierIsPerProvider is the regression test for cross-provider
+// contamination: two providers co-hosted in one process (a Free account and a
+// Plus account) each gate on their OWN client's tier, not a shared process
+// global. The old auth.ISPlus-based gate read whichever client wrote last, so a
+// Free provider could advertise/dial Plus-only exits and a Plus provider could
+// be told its account is Free.
+func TestCheckExitTierIsPerProvider(t *testing.T) {
+	free := &Provider{watchCh: make(chan struct{}, 1), stopped: make(chan struct{})}
+	free.client = &levelClient{isPlus: false, known: true}
+	plus := &Provider{watchCh: make(chan struct{}, 1), stopped: make(chan struct{})}
+	plus.client = &levelClient{isPlus: true, known: true}
+
+	plusOnly := []string{"Plus"}
+	if err := free.checkExitTier("e", plusOnly); err == nil {
+		t.Fatal("Free provider should reject a Plus-only exit")
+	}
+	if err := plus.checkExitTier("e", plusOnly); err != nil {
+		t.Fatalf("Plus provider should accept a Plus-only exit: %v", err)
 	}
 }

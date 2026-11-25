@@ -14,8 +14,9 @@
 //     String(String). The default Rust client sends STRING ids like
 //     "req-<random>". JrpcID below preserves the raw JSON id bytes verbatim
 //     so a Go server can echo a Rust client's string id (and vice-versa)
-//     without interpreting it. The Go client assigns numeric ids, which the
-//     Rust broker echoes back unchanged.
+//     without interpreting it. The Go client assigns random STRING ids
+//     ("req-<random>") like Rust, so the broker's (id, method) dedup cache
+//     never replays a stale response across clients or restarts.
 //   - Rust's JrpcResponse has `result` and `error` as Option<Value> with
 //     skip_serializing_if = "Option::is_none": a SUCCESS response OMITS the
 //     "error" key, and an ERROR response OMITS the "result" key. We mirror
@@ -28,6 +29,8 @@ package nanorpc
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"sync/atomic"
@@ -50,6 +53,26 @@ func (id *JrpcID) SetNumber(n int64) {
 	b, _ := json.Marshal(n) // never errors for an int64
 	id.Raw = b
 }
+
+// SetRandom assigns a unique string id ("req-<random u64>"), matching the Rust
+// nanorpc client's default id scheme. The broker deduplicates responses by
+// (id, method) for ~120s, so sequential numeric ids collide across clients /
+// restarts and replay a stale (possibly errored) response. A random id avoids
+// that. crypto/rand failure falls back to a monotonic counter so an id is
+// always assigned.
+func (id *JrpcID) SetRandom() {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		id.SetNumber(fallbackID.Add(1))
+		return
+	}
+	s := fmt.Sprintf("req-%d", binary.BigEndian.Uint64(b[:]))
+	raw, _ := json.Marshal(s)
+	id.Raw = raw
+}
+
+// fallbackID is only used if crypto/rand fails (extremely rare).
+var fallbackID atomic.Int64
 
 // MarshalJSON renders the id verbatim. A zero (unset) id marshals as null,
 // matching serde's serialization of an absent id in contexts that require a
@@ -125,7 +148,7 @@ func (c *Client) Call(ctx context.Context, method string, params json.RawMessage
 		Method:  method,
 		Params:  params,
 	}
-	req.ID.SetNumber(c.nextID.Add(1) - 1)
+	req.ID.SetRandom()
 	resp, err := c.transport.CallRaw(ctx, req)
 	if err != nil {
 		return fmt.Errorf("nanorpc: transport error calling %q: %w", method, err)
@@ -158,7 +181,7 @@ func (e *ServerError) Error() string {
 // protocol's broker_rpc). The request's ID is assigned here if unset.
 func (c *Client) CallRaw(ctx context.Context, req *JrpcRequest) (*JrpcResponse, error) {
 	if req.ID.IsZero() {
-		req.ID.SetNumber(c.nextID.Add(1) - 1)
+		req.ID.SetRandom()
 	}
 	if req.JSONRPC == "" {
 		req.JSONRPC = "2.0"

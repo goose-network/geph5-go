@@ -154,6 +154,14 @@ func fetchFreshExitRoute(
 	if brokerClient == nil {
 		return brokerproto.ExitRouteDescriptor{}, errors.New("dialer: broker client is nil")
 	}
+	// Rust aborts the fresh-route fetch without a connect token (get_dialer.rs
+	// `get_connect_token(...)?`) and falls back to the cached route. Mirror that:
+	// never send get_exit_route with null token/sig — Rust's ClientToken /
+	// UnblindedSignature are non-Option fields that cannot deserialize null,
+	// which the broker rejects as "deserialization of argument 0 failed".
+	if isNullJSON(args.Token) || isNullJSON(args.Sig) {
+		return brokerproto.ExitRouteDescriptor{}, errors.New("dialer: no connect token (auth not ready)")
+	}
 	signed, err := brokerClient.GetExitRoute(ctx, args)
 	if err != nil {
 		return brokerproto.ExitRouteDescriptor{}, fmt.Errorf("dialer: broker get_exit_route: %w", err)
@@ -372,6 +380,12 @@ func (d plainTLSDialer) Dial(ctx context.Context) (sillad.Pipe, error) {
 		ProtocolStr: "tls",
 		RemoteStr:   lower.RemoteAddrStr(),
 	}, nil
+}
+
+// isNullJSON reports whether a raw JSON value is absent (empty) or the literal
+// null. Used to detect an unset connect token / signature before get_exit_route.
+func isNullJSON(b []byte) bool {
+	return len(b) == 0 || string(b) == "null"
 }
 
 // splitOnce splits s on the first occurrence of sep, returning the part before

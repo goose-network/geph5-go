@@ -227,10 +227,32 @@ func (c *Client) OpenConn(ctx context.Context, remote string) (net.Conn, error) 
 	return c.openConn(ctx, remote)
 }
 
+// DialThrough opens a tunneled connection to remote over an existing transport
+// conn (via) that already reaches the pinned exit, establishing a one-off
+// authenticated session rather than using the background pool. It is the
+// proxy-chaining entry point (the goose router's ChainDialer): the previous hop
+// tunneled to the exit's c2e listener, and geph runs its handshake + mux over
+// that tunnel. Requires a direct (pinned) exit constraint. On success the
+// returned conn owns via (closing it tears down the session); on error via is
+// closed.
+func (c *Client) DialThrough(ctx context.Context, via net.Conn, remote string) (net.Conn, error) {
+	return c.sessMgr.DialThrough(ctx, via, "tcp", remote)
+}
+
 // SessionCount returns the current number of live exit sessions the session
 // manager maintains. It is the readiness signal embedders poll: the SOCKS5
 // listener is bound from Start on, but CONNECTs succeed only once this is > 0.
 func (c *Client) SessionCount() int { return len(c.sessMgr.LiveSessionInfos()) }
+
+// AccountLevel reports this client's own account tier and whether it is known
+// yet, from its per-client auth manager — not the process-global auth.ISPlus,
+// which every embedded client overwrites. Embedders co-hosting several clients
+// (one per goose provider spec) use it to gate exits by their OWN credential.
+// known is false until the first auth completes, so a cold client is not
+// misclassified during warmup.
+func (c *Client) AccountLevel() (isPlus bool, known bool) {
+	return c.sessMgr.AccountLevel()
+}
 
 // BrokerClient returns the broker client this client was started with, so
 // embedders can make their own broker RPCs (e.g. the exit roster via

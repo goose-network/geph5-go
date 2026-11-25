@@ -16,7 +16,7 @@ import (
 //   { "fallback": [ ... ] }
 //   { "timeout": { "milliseconds": u32, "lower": <RouteDescriptor> } }
 //   { "delay": { "milliseconds": u32, "lower": <RouteDescriptor> } }
-//   { "conntest": { "ping_count": u32, "lower": <RouteDescriptor> } }
+//   { "conn_test": { "ping_count": u32, "lower": <RouteDescriptor> } }
 //   { "hex": { "lower": <RouteDescriptor> } }
 //   { "meeklike": { "key": str, "cfg": <MeeklikeConfig>, "lower": <RouteDescriptor> } }
 //   <any other JSON>                          (Other, untagged catch-all)
@@ -62,7 +62,11 @@ func DefaultMeeklikeConfig() MeeklikeConfig {
 func (r RouteDescriptor) MarshalJSON() ([]byte, error) {
 	switch r.Kind {
 	case "tcp":
-		return json.Marshal(r.TcpAddr)
+		// Rust's RouteDescriptor::Tcp is an externally-tagged newtype variant:
+		// {"tcp":"ip:port"}, NOT a bare string (a bare string falls through to
+		// the untagged Other catch-all on a Rust peer). The decoder still accepts
+		// a bare string for backward compat with Go's own route cache.
+		return json.Marshal(map[string]string{"tcp": r.TcpAddr})
 	case "sosistab3":
 		return json.Marshal(map[string]any{
 			"sosistab3": map[string]any{"cookie": r.Cookie, "lower": r.Lower},
@@ -84,8 +88,11 @@ func (r RouteDescriptor) MarshalJSON() ([]byte, error) {
 			"delay": map[string]any{"milliseconds": r.Milliseconds, "lower": r.Lower},
 		})
 	case "conntest":
+		// Rust's RouteDescriptor uses #[serde(rename_all = "snake_case")], so the
+		// ConnTest variant is externally tagged "conn_test" (NOT "conntest"). The
+		// internal Kind stays "conntest"; only the wire key changes.
 		return json.Marshal(map[string]any{
-			"conntest": map[string]any{"ping_count": r.PingCount, "lower": r.Lower},
+			"conn_test": map[string]any{"ping_count": r.PingCount, "lower": r.Lower},
 		})
 	case "hex":
 		return json.Marshal(map[string]any{"hex": map[string]any{"lower": r.Lower}})
@@ -142,7 +149,9 @@ func (r *RouteDescriptor) UnmarshalJSON(b []byte) error {
 		case "delay":
 			r.Kind = "delay"
 			return decodeMsStruct(v, &r.Milliseconds, &r.Lower)
-		case "conntest":
+		case "conn_test", "conntest":
+			// "conn_test" is the Rust snake_case wire key; "conntest" is accepted
+			// as a decode alias for backward compat with Go's own route cache.
 			r.Kind = "conntest"
 			return decodePingStruct(v, &r.PingCount, &r.Lower)
 		case "hex":

@@ -6,12 +6,15 @@ import (
 	"fmt"
 )
 
-// AccountLevel mirrors geph5_broker_protocol::AccountLevel (snake_case).
+// AccountLevel mirrors geph5_broker_protocol::AccountLevel. The Rust enum has
+// NO #[serde(rename_all)], so serde uses the variant names verbatim: "Free" /
+// "Plus" (PascalCase). The stdcode encoding (marshalConnectToken) uses the
+// variant INDEX (Free=0, Plus=1), independent of these JSON strings.
 type AccountLevel string
 
 const (
-	AccountLevelFree AccountLevel = "free"
-	AccountLevelPlus AccountLevel = "plus"
+	AccountLevelFree AccountLevel = "Free"
+	AccountLevelPlus AccountLevel = "Plus"
 )
 
 // BwConsumptionInfo mirrors geph5_broker_protocol::BwConsumptionInfo.
@@ -145,9 +148,42 @@ func (c *ExitConstraint) UnmarshalJSON(b []byte) error {
 // route: RouteDescriptor }. exit_pubkey is a 32-byte ed25519 VerifyingKey,
 // which ed25519-dalek serializes as a JSON byte array ([u8; 32]).
 type ExitRouteDescriptor struct {
-	ExitPubkey []byte          `json:"exit_pubkey"` // 32 bytes, JSON array
+	ExitPubkey []byte          `json:"exit_pubkey"` // 32 bytes, JSON array of ints
 	Exit       ExitDescriptor  `json:"exit"`
 	Route      RouteDescriptor `json:"route"`
+}
+
+// exitRouteDescriptorWire keeps exit_pubkey as raw JSON so it can be decoded
+// from the ed25519-dalek integer-array form (Go's []byte codec expects base64).
+type exitRouteDescriptorWire struct {
+	ExitPubkey json.RawMessage `json:"exit_pubkey"`
+	Exit       ExitDescriptor  `json:"exit"`
+	Route      RouteDescriptor `json:"route"`
+}
+
+// MarshalJSON encodes exit_pubkey as a JSON array of integers (serde).
+func (r ExitRouteDescriptor) MarshalJSON() ([]byte, error) {
+	return json.Marshal(exitRouteDescriptorWire{
+		ExitPubkey: encodeByteArray(r.ExitPubkey),
+		Exit:       r.Exit,
+		Route:      r.Route,
+	})
+}
+
+// UnmarshalJSON decodes exit_pubkey from the integer-array (or base64) form.
+func (r *ExitRouteDescriptor) UnmarshalJSON(b []byte) error {
+	var w exitRouteDescriptorWire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	pk, err := decodeByteArray(w.ExitPubkey)
+	if err != nil {
+		return fmt.Errorf("brokerproto: exit_pubkey: %w", err)
+	}
+	r.ExitPubkey = pk
+	r.Exit = w.Exit
+	r.Route = w.Route
+	return nil
 }
 
 // ExitPubkeyHex returns exit_pubkey as a lowercase hex string, for comparison
@@ -173,7 +209,7 @@ type ExitListEntry struct {
 
 func (e ExitListEntry) MarshalJSON() ([]byte, error) {
 	return json.Marshal([2]json.RawMessage{
-		mustJSON(e.Pubkey),
+		encodeByteArray(e.Pubkey),
 		mustJSON(e.Exit),
 	})
 }
@@ -183,9 +219,11 @@ func (e *ExitListEntry) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &arr); err != nil {
 		return err
 	}
-	if err := json.Unmarshal(arr[0], &e.Pubkey); err != nil {
-		return err
+	pk, err := decodeByteArray(arr[0])
+	if err != nil {
+		return fmt.Errorf("brokerproto: exit list pubkey: %w", err)
 	}
+	e.Pubkey = pk
 	return json.Unmarshal(arr[1], &e.Exit)
 }
 
@@ -209,7 +247,7 @@ func (e NetStatusEntry) PubkeyHex() string { return hex.EncodeToString(e.Pubkey)
 // MarshalJSON encodes as a 3-element JSON array.
 func (e NetStatusEntry) MarshalJSON() ([]byte, error) {
 	return json.Marshal([3]json.RawMessage{
-		mustJSON(e.Pubkey),
+		encodeByteArray(e.Pubkey),
 		mustJSON(e.Exit),
 		mustJSON(e.Metadata),
 	})
@@ -221,9 +259,11 @@ func (e *NetStatusEntry) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &arr); err != nil {
 		return err
 	}
-	if err := json.Unmarshal(arr[0], &e.Pubkey); err != nil {
-		return err
+	pk, err := decodeByteArray(arr[0])
+	if err != nil {
+		return fmt.Errorf("brokerproto: net status pubkey: %w", err)
 	}
+	e.Pubkey = pk
 	if err := json.Unmarshal(arr[1], &e.Exit); err != nil {
 		return err
 	}

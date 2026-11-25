@@ -28,6 +28,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,13 @@ const (
 	livenessPingInterval = 1200 * time.Second
 	livenessTimeout      = 120 * time.Second
 )
+
+// dialThroughEstablishTimeout bounds the one-off chained session's establishment
+// phase (conntest ping, client_auth handshake, mux metadata + tunnel open). Those
+// steps read from the raw upstream transport, which does not watch ctx, so a
+// silent c2e peer would otherwise hang the chained request indefinitely. The
+// deadline is cleared once the tunnel is up so the proxied data path is unbounded.
+const dialThroughEstablishTimeout = 30 * time.Second
 
 // Manager owns the session pool and the machinery to establish authenticated
 // tunnels to the exit. It is safe for concurrent use.
@@ -117,6 +125,17 @@ func NewManager(cfg *config.Config, authMgr *auth.Manager, broker *brokerproto.B
 		m.sessMetadata = json.RawMessage("null")
 	}
 	return m
+}
+
+// AccountLevel reports the embedded auth manager's own account tier (per-client,
+// not the process-global auth.ISPlus) and whether it is known yet. Embedders use
+// it to gate exit eligibility by this client's credential. A nil auth manager
+// (no broker) reports unknown.
+func (m *Manager) AccountLevel() (isPlus bool, known bool) {
+	if m.authMgr == nil {
+		return false, false
+	}
+	return m.authMgr.AccountLevel()
 }
 
 // Run starts TARGET_SESSION_COUNT session workers plus a route-refresh
@@ -277,15 +296,27 @@ func (m *Manager) runSessionOnce(ctx, dialCtx context.Context, id int) error {
 	}
 }
 
+// exitRouteClientMetadata is the client_metadata sent to broker.get_exit_route.
+// Rust's get_device_metadata always sends at least {"version": CARGO_PKG_VERSION}
+// (never bare null); the broker gates meeklike race routes on version >=0.2.72
+// and reads ip_addr for ASN/country bridge tuning. We send the port's version
+// (the geph5 workspace is 0.4.0) so the broker compiles the same route tree it
+// gives a real client. This is DISTINCT from sessMetadata, which is the mux
+// metadata stream opened at session.go's mux.Open.
+var exitRouteClientMetadata = json.RawMessage(`{"version":"0.4.0"}`)
+
 // fetchDialer compiles the exit route into a dialer, returning the exit's
 // ed25519 public key, its descriptor, and a sillad.Dialer. It supplies the
 // connect token (for the broker's get_exit_route args) when available.
 func (m *Manager) fetchDialer(ctx context.Context) (exitPubkey []byte, exit brokerproto.ExitDescriptor, dial sillad.Dialer, err error) {
 	args := brokerproto.GetExitRouteArgs{
 		ExitConstraint: m.exitConstraint,
-		ClientMetadata: m.sessMetadata,
+		ClientMetadata: exitRouteClientMetadata,
 	}
-	// Attach the connect token + signature if the auth manager has one.
+	// Attach the connect token + signature if the auth manager has one. When
+	// auth is not ready this leaves Token/Sig nil; fetchFreshExitRoute then
+	// aborts the fresh fetch (never sending null token/sig to the broker) and
+	// GetDialer falls back to the cached route, matching Rust's get_dialer.
 	if m.authMgr != nil {
 		if ct, tokErr := m.authMgr.GetConnectToken(ctx); tokErr == nil {
 			tokenJSON, _ := json.Marshal(ct.Token) // ClientToken -> JSON byte array
@@ -541,6 +572,110 @@ func (m *Manager) AsOpenConnFunc() OpenConnFunc {
 		}
 		return pipe, nil
 	}
+}
+
+// DialThrough establishes a ONE-OFF authenticated session over an existing
+// transport conn (via) that already reaches the exit, then opens a tunneled
+// stream to remote. It is the proxy-chaining entry point (the goose router's
+// ChainDialer): the previous hop has already tunneled to the exit's c2e
+// listener, so geph runs its route handshake (conntest ping, client_auth) and
+// picomux over that tunnel instead of dialing the exit from the local network.
+//
+// Only a single-transport route is supported — a "direct" (pinned) exit
+// constraint, which compiles to ConnTest{Tcp(c2e)}. A race/fallback/auto tree
+// would dial the raw transport more than once and cannot ride a single via, so
+// it is rejected. The route's own layers still run over via: the conntest ping
+// is echoed by the exit, and client_auth does the X25519 exchange (the raw TCP
+// transport carries no shared secret).
+//
+// Ownership: on success the returned conn owns via — closing it tears down the
+// one-off mux and via. On error via is closed here (the router also closes the
+// previous conn on a failed DialThrough; the double close is benign).
+func (m *Manager) DialThrough(ctx context.Context, via net.Conn, protocol, remote string) (conn net.Conn, err error) {
+	if m.exitConstraint.Kind != "direct" {
+		return nil, fmt.Errorf("session: DialThrough requires a direct (pinned) exit constraint, got %q", m.exitConstraint.Kind)
+	}
+	defer func() {
+		if err != nil {
+			via.Close()
+		}
+	}()
+	// Bound establishment so a silent c2e peer fails fast rather than hanging the
+	// chained request forever: the conntest/auth/tunnel-open reads run on the raw
+	// transport (and then the mux read loop feeding them), none of which watch
+	// ctx. A deadline on via propagates to all of them. Honor a shorter ctx
+	// deadline when present; cleared on success below so data is unbounded.
+	establishDeadline := time.Now().Add(dialThroughEstablishTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(establishDeadline) {
+		establishDeadline = d
+	}
+	_ = via.SetDeadline(establishDeadline)
+	// The route's single raw TCP dial yields via; every higher layer (conntest,
+	// and sosistab3/tls if a future direct route carried them) runs over it.
+	viaDialer := func(context.Context, string, string) (net.Conn, error) { return via, nil }
+	// A direct constraint is resolved client-side (getDialerDirect) and never
+	// sent to the broker, so the connect token / signature are not needed here.
+	args := brokerproto.GetExitRouteArgs{
+		ExitConstraint: m.exitConstraint,
+		ClientMetadata: exitRouteClientMetadata,
+	}
+	exitPubkey, _, dial, err := dialer.GetDialer(ctx, m.exitConstraint, m.allowDirect, m.brokerKeys, m.broker, m.db, args, viaDialer)
+	if err != nil {
+		return nil, fmt.Errorf("session: dial_through get_dialer: %w", err)
+	}
+	pipe, err := dial.Dial(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("session: dial_through dial: %w", err)
+	}
+	authedPipe, err := m.clientAuth(ctx, pipe, exitPubkey)
+	if err != nil {
+		return nil, fmt.Errorf("session: dial_through client_auth: %w", err)
+	}
+	mux := picomux.New(authedPipe)
+	mux.SetLiveness(picomux.LivenessConfig{
+		PingInterval: livenessPingInterval,
+		Timeout:      livenessTimeout,
+	})
+	mux.SetDebloat(true)
+	// Register the session metadata first (the exit only accepts tunnel-command
+	// streams once it has read the metadata stream), exactly as runSessionOnce.
+	if metaStream, e := mux.Open(m.sessMetadata); e == nil {
+		metaStream.Close()
+	}
+	cmd := tunnelcmd.TunnelCommand{
+		Kind:     tunnelcmd.KindRich,
+		Protocol: protocol,
+		Host:     remote,
+	}
+	stream, err := mux.Open([]byte(cmd.String()))
+	if err != nil {
+		return nil, fmt.Errorf("session: dial_through open tunnel: %w", err)
+	}
+	resp, err := tunnelcmd.ReadTunnelResponse(stream)
+	if err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("session: dial_through read tunnel response: %w", err)
+	}
+	if resp.Kind != tunnelcmd.KindSuccess {
+		stream.Close()
+		return nil, fmt.Errorf("session: dial_through tunnel open failed: %s", resp.Fail)
+	}
+	// Establishment complete: clear the transport deadline so the proxied data
+	// path is not bounded by the establishment timeout.
+	_ = via.SetDeadline(time.Time{})
+	// getDialerDirect returns a placeholder descriptor (Country "AW", C2EListen
+	// "0.0.0.0:0"); label the session with the real pinned c2e from the direct
+	// constraint ("host:port/pubkeyhex") instead.
+	c2e := m.exitConstraint.Direct
+	if i := strings.IndexByte(c2e, '/'); i >= 0 {
+		c2e = c2e[:i]
+	}
+	label := fmt.Sprintf("exit %s (pinned)", c2e)
+	log.Printf("session: dial_through connected to %s via upstream tunnel", label)
+	return &oneShotStreamPipe{
+		streamPipe: &streamPipe{Stream: stream, protocol: "picomux", remoteStr: label},
+		mux:        mux,
+	}, nil
 }
 
 // SendVPNPacket is a placeholder for the VPN packet pump. The full VPN

@@ -89,9 +89,11 @@ type GetConnectTokenArgs struct {
 	BlindToken json.RawMessage `json:"blind_token"`
 }
 
-// GetConnectToken calls broker.get_connect_token -> BlindedSignature.
+// GetConnectToken calls broker.get_connect_token(auth_token, level, epoch,
+// blind_token) -> BlindedSignature. Rust takes four POSITIONAL params, so the
+// args struct is flattened into a 4-element array (NOT wrapped as one object).
 func (c *BrokerClient) GetConnectToken(ctx context.Context, args GetConnectTokenArgs) (json.RawMessage, error) {
-	params, _ := json.Marshal([]interface{}{args})
+	params, _ := json.Marshal([]interface{}{args.AuthToken, args.Level, args.Epoch, args.BlindToken})
 	var raw json.RawMessage
 	if err := c.rpc.Call(ctx, "get_connect_token", params, &raw); err != nil {
 		return nil, err

@@ -66,8 +66,11 @@ func (t ClientToken) BlindWith(random interface{ Read([]byte) (int, error) }, pu
 }
 
 // ----------------------------------------------------------------------------
-// RSA key (de)serialization helpers — PKCS#1 DER, matching Rust
-// rsa::pkcs1::EncodeRsaPublicKey / SecretKey::to_der / from_der.
+// RSA key (de)serialization helpers. The production broker's brs::PublicKey
+// uses PKIX/SPKI DER (from_der/to_der); decoding auto-detects PKIX or PKCS#1.
+// Local test/server-side key generation below still emits PKCS#1, which the
+// auto-detecting decoder accepts. The Merkle proof hashes the raw DER bytes,
+// so it is format-agnostic (matches the broker's PKIX-based tree on the wire).
 // ----------------------------------------------------------------------------
 
 // publicKeyToPKCS1DER encodes an RSA public key as PKCS#1 DER
@@ -76,13 +79,23 @@ func publicKeyToPKCS1DER(pub *rsa.PublicKey) ([]byte, error) {
 	return x509.MarshalPKCS1PublicKey(pub), nil
 }
 
-// pkcs1DERToPublicKey decodes a PKCS#1 DER RSA public key.
+// pkcs1DERToPublicKey decodes an RSA public key from DER. The production geph5
+// broker (brs::PublicKey::from_der) emits PKIX/SPKI (SubjectPublicKeyInfo) —
+// confirmed against live broker.geph.io get_mizaru_subkey responses — so try
+// PKIX first and fall back to PKCS#1 for locally-generated/test keys. The
+// historical name is kept for API stability.
 func pkcs1DERToPublicKey(der []byte) (*rsa.PublicKey, error) {
+	if pub, err := x509.ParsePKIXPublicKey(der); err == nil {
+		if rsaPub, ok := pub.(*rsa.PublicKey); ok {
+			return rsaPub, nil
+		}
+	}
 	return x509.ParsePKCS1PublicKey(der)
 }
 
-// ParsePKCS1PublicKey decodes a PKCS#1 DER RSA public key (exported wrapper
-// around pkcs1DERToPublicKey for use by the auth client).
+// ParsePKCS1PublicKey decodes an RSA public key from DER (PKIX/SPKI as the
+// production broker emits, or PKCS#1). Exported wrapper around
+// pkcs1DERToPublicKey for use by the auth client.
 func ParsePKCS1PublicKey(der []byte) (*rsa.PublicKey, error) {
 	return pkcs1DERToPublicKey(der)
 }

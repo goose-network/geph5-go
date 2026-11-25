@@ -269,16 +269,13 @@ func (s *State) encryptInner(data []byte, output *[]byte, isPadding bool) int {
 	} else {
 		binary.LittleEndian.PutUint32(lengthBytes[:], uint32(int32(len(data))))
 	}
-	// Encrypt the length with the next nonce.
+	// Encrypt the length with the next nonce. The 4 length bytes are the
+	// PLAINTEXT (no additional data), mirroring Rust encrypt_in_place_detached
+	// over the length buffer with an empty AAD. ChaCha20Poly1305 Seal returns
+	// ciphertext||tag, so encLen is 4+16 = 20 bytes: first 4 = encrypted length,
+	// last 16 = tag. (The Decrypt side Opens encLength||tagLength with nil AAD.)
 	nonce := s.nextSendNonce()
-	// encrypt_in_place_detached: encrypt length in place, append tag.
-	encLen := s.sendAEAD.Seal(nil, nonce[:], nil, lengthBytes[:])
-	// Seal with nil plaintext produces just the tag (16 bytes) when dst=nil?
-	// Actually Seal(nil, nonce, plaintext, nil) = ciphertext+tag. For
-	// encrypt_in_place_detached we want: ciphertext = plaintext (XChaCha
-	// keystream XOR), tag separate. ChaCha20Poly1305 Seal produces
-	// ciphertext||tag where ciphertext = plaintext XOR keystream. So encLen is
-	// 4+16 = 20 bytes: first 4 = encrypted length, last 16 = tag.
+	encLen := s.sendAEAD.Seal(nil, nonce[:], lengthBytes[:], nil)
 	encLength := encLen[:4]
 	tagLen := encLen[4:20]
 	*output = append(*output, encLength...)
