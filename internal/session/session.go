@@ -175,10 +175,31 @@ func (m *Manager) refreshLoop(ctx context.Context) {
 	}
 }
 
+// maxBackoffExponent clamps the session worker's 2^failures multiplier.
+// failures is unbounded (it counts consecutive failures for the log line);
+// shifting int64 by 63 wraps negative and by >= 64 yields 0, which collapsed
+// the dial timeout and retry wait to <= 0 and spun the worker in a hot loop
+// that no network recovery could break. 2^12 = 4096 already saturates the
+// 120s caps (timeout base >= 30s; wait base >= 30ms), so the clamp only bites
+// where the caps already dominate. Mirrors the clamped shift in
+// meeklike/virta.go's retransmit backoff.
+const maxBackoffExponent = 12
+
+// backoffScale returns 2^min(failures, maxBackoffExponent) as a Duration
+// multiplier, clamping the exponent BEFORE the shift so the product cannot
+// overflow int64 nanoseconds.
+func backoffScale(failures int) time.Duration {
+	exponent := uint(failures)
+	if exponent > maxBackoffExponent {
+		exponent = maxBackoffExponent
+	}
+	return time.Duration(1 << exponent)
+}
+
 // sessionWorker maintains a single session with exponential backoff. Worker 0
 // starts immediately; workers 1+ jitter 0..120s. On failure the wait time
-// grows as rand(0..0.1)*2^failures (capped 120s); the dial timeout grows as
-// rand(30..60)*2^failures (capped 120s).
+// grows as rand(0..0.1)*2^min(failures,12) (capped 120s); the dial timeout grows
+// as rand(30..60)*2^min(failures,12) (capped 120s).
 func (m *Manager) sessionWorker(ctx context.Context, id int) {
 	// Initial jitter for workers after the first.
 	if id > 0 {
@@ -198,8 +219,7 @@ func (m *Manager) sessionWorker(ctx context.Context, id int) {
 		timeoutSecs := 30 + rand.Intn(31) // 30..60
 		timeout := time.Duration(timeoutSecs) * time.Second
 		if failures > 0 {
-			scale := time.Duration(1 << uint(failures))
-			timeout *= scale
+			timeout *= backoffScale(failures)
 			if timeout > 120*time.Second {
 				timeout = 120 * time.Second
 			}
@@ -220,8 +240,7 @@ func (m *Manager) sessionWorker(ctx context.Context, id int) {
 		// Backoff wait.
 		wait := time.Duration(rand.Float64()*0.1*1000) * time.Millisecond
 		if failures > 0 {
-			scale := time.Duration(1 << uint(failures))
-			wait *= scale
+			wait *= backoffScale(failures)
 			if wait > 120*time.Second {
 				wait = 120 * time.Second
 			}
